@@ -800,12 +800,34 @@ delay_ms = $delay_ms
 # macOS virtual key codes for common characters
 # This allows pygame/SDL apps to receive proper key events (they check event.key, not unicode)
 KEY_CODES = {
+    # Letters
     'a': 0, 's': 1, 'd': 2, 'f': 3, 'h': 4, 'g': 5, 'z': 6, 'x': 7, 'c': 8, 'v': 9,
-    'b': 11, 'q': 12, 'w': 13, 'e': 14, 'r': 15, 'y': 16, 't': 17,
-    '1': 18, '2': 19, '3': 20, '4': 21, '6': 22, '5': 23, '=': 24,
-    '9': 25, '7': 26, '-': 27, '8': 28, '0': 29, ']': 30, 'o': 31,
-    'u': 32, '[': 33, 'i': 34, 'p': 35, 'l': 37, 'j': 38, "'": 39,
-    'k': 40, ';': 41, ',': 43, '/': 44, 'n': 45, 'm': 46, '.': 47,
+    'b': 11, 'q': 12, 'w': 13, 'e': 14, 'r': 15, 'y': 16, 't': 17, 'o': 31,
+    'u': 32, 'i': 34, 'p': 35, 'l': 37, 'j': 38, 'k': 40, 'n': 45, 'm': 46,
+    # Numbers and their shifted symbols
+    '1': 18, '!': 18,
+    '2': 19, '@': 19,
+    '3': 20, '#': 20,
+    '4': 21, '$': 21,
+    '5': 23, '%': 23,
+    '6': 22, '^': 22,
+    '7': 26, '&': 26,
+    '8': 28, '*': 28,
+    '9': 25, '(': 25,
+    '0': 29, ')': 29,
+    # Punctuation and their shifted variants
+    '-': 27, '_': 27,
+    '=': 24, '+': 24,
+    '[': 33, '{': 33,
+    ']': 30, '}': 30,
+    '\\\\': 42, '|': 42,
+    ';': 41, ':': 41,
+    "'": 39, '"': 39,
+    ',': 43, '<': 43,
+    '.': 47, '>': 47,
+    '/': 44, '?': 44,
+    '\`': 50, '~': 50,
+    # Whitespace
     ' ': 49,
 }
 # Add uppercase letters (same key codes, will set shift flag if needed)
@@ -817,25 +839,29 @@ for char in text:
     key_code = KEY_CODES.get(char, 0)
 
     # Check if we need shift modifier (uppercase or shifted symbols)
-    needs_shift = char.isupper() or char in '~!@#$%^&*()_+{}|:"<>?'
+    needs_shift = char.isupper() or char in '~!@#$%^&*()_+{}|:<>?"'
 
     # Create key events with proper key code
     event_down = Quartz.CGEventCreateKeyboardEvent(None, key_code, True)
     event_up = Quartz.CGEventCreateKeyboardEvent(None, key_code, False)
 
-    # Set shift flag if needed
+    # Set ONLY shift flag if needed, otherwise clear all flags
     if needs_shift:
         Quartz.CGEventSetFlags(event_down, Quartz.kCGEventFlagMaskShift)
         Quartz.CGEventSetFlags(event_up, Quartz.kCGEventFlagMaskShift)
+    else:
+        # Clear all modifier flags to prevent accidental Cmd+key, etc.
+        Quartz.CGEventSetFlags(event_down, 0)
+        Quartz.CGEventSetFlags(event_up, 0)
 
     # Also set unicode character (for apps that use text input system)
     Quartz.CGEventKeyboardSetUnicodeString(event_down, 1, char)
     Quartz.CGEventKeyboardSetUnicodeString(event_up, 1, char)
 
-    # Post events
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_down)
+    # Post to session tap (more appropriate for app input than HID tap)
+    Quartz.CGEventPost(Quartz.kCGSessionEventTap, event_down)
     time.sleep(0.01)  # 10ms between down/up
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event_up)
+    Quartz.CGEventPost(Quartz.kCGSessionEventTap, event_up)
 
     # Inter-character delay
     time.sleep(delay_ms / 1000.0)
@@ -880,11 +906,19 @@ press_key() {
 import Quartz
 import time
 key_code = $key_code
+
+# Create events with NO modifier flags (clear any residual modifiers)
 down = Quartz.CGEventCreateKeyboardEvent(None, key_code, True)
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
-time.sleep(0.02)
 up = Quartz.CGEventCreateKeyboardEvent(None, key_code, False)
-Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+# Explicitly clear all modifier flags to prevent Cmd+Enter, etc.
+Quartz.CGEventSetFlags(down, 0)
+Quartz.CGEventSetFlags(up, 0)
+
+# Post to session tap (more appropriate for app input than HID tap)
+Quartz.CGEventPost(Quartz.kCGSessionEventTap, down)
+time.sleep(0.02)
+Quartz.CGEventPost(Quartz.kCGSessionEventTap, up)
 PYEOF
 }
 
