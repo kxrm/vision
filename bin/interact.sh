@@ -1530,6 +1530,189 @@ quit_app() {
     osascript -e "tell application \"$app\" to quit"
 }
 
+# Browse to URL or path - finds existing tab/window or opens new one
+# Usage: browse_url <url_or_path> [app]
+# For browsers: finds tab with matching domain
+# For Finder: finds window with exact matching path
+browse_url() {
+    local target="$1"
+    local app="${2:-$IN_APP}"
+
+    # Check if target is a file path (starts with /, ~, or .)
+    if [[ "$target" =~ ^[/~.] ]]; then
+        # Expand ~ and resolve to absolute path
+        local abs_path
+        abs_path=$(cd "$(dirname "$target")" 2>/dev/null && pwd)/$(basename "$target")
+        [[ "$target" == ~* ]] && abs_path="${target/#\~/$HOME}"
+
+        echo "Browse: Looking for Finder window at '$abs_path'"
+
+        # Search Finder windows for exact path match
+        local found_window
+        found_window=$(osascript -e "
+            tell application \"Finder\"
+                set windowCount to count of windows
+                repeat with i from 1 to windowCount
+                    try
+                        set w to window i
+                        set winPath to POSIX path of (target of w as alias)
+                        -- Remove trailing slash for comparison
+                        if winPath ends with \"/\" then
+                            set winPath to text 1 thru -2 of winPath
+                        end if
+                        set comparePath to \"$abs_path\"
+                        if comparePath ends with \"/\" then
+                            set comparePath to text 1 thru -2 of comparePath
+                        end if
+                        if winPath is equal to comparePath then
+                            set index of w to 1
+                            return \"found\"
+                        end if
+                    end try
+                end repeat
+                return \"\"
+            end tell
+        " 2>/dev/null)
+
+        if [[ "$found_window" == "found" ]]; then
+            echo "Browse: Found existing Finder window, bringing to front"
+            activate_app "Finder"
+            return 0
+        else
+            echo "Browse: No existing window, opening new Finder window"
+            open "$abs_path"
+            return 0
+        fi
+    fi
+
+    # URL handling for browsers
+    local browser="${app:-}"
+
+    # Extract domain from URL (handles both "domain.com" and "https://domain.com/path")
+    local domain
+    domain=$(echo "$target" | sed -E 's|^https?://||; s|^www\.||; s|/.*$||')
+
+    # If no browser specified, detect frontmost browser app
+    if [[ -z "$browser" ]]; then
+        browser=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null)
+    fi
+
+    echo "Browse: Looking for '$domain' in $browser"
+
+    local tab_index=""
+    local found_tab=false
+
+    # Firefox: Use session file (AppleScript doesn't expose tab URLs)
+    if [[ "$browser" == "Firefox" ]]; then
+        tab_index=$("$PYTHON" "$SCRIPT_DIR/../lib/firefox_tabs.py" --search "$domain" --index-only 2>/dev/null)
+
+        if [[ -n "$tab_index" ]]; then
+            echo "Browse: Found existing tab at index $tab_index"
+            activate_app "$browser"
+            sleep 0.2
+
+            if [[ "$tab_index" -le 8 ]]; then
+                key_combo "cmd+$tab_index"
+            else
+                # Tab > 8 - cycle from tab 1
+                key_combo "cmd+1"
+                for ((i=1; i<tab_index; i++)); do
+                    key_combo "ctrl+tab"
+                    sleep 0.05
+                done
+            fi
+            return 0
+        fi
+        found_tab=true  # Firefox supported, no matching tab found
+    fi
+
+    # Try Chrome-style AppleScript (works for Chrome, Brave, Edge, Arc, etc.)
+    if [[ "$found_tab" == false ]]; then
+        local chrome_result
+        chrome_result=$(osascript -e "
+            tell application \"$browser\"
+                repeat with w in windows
+                    set tabNum to 0
+                    repeat with t in tabs of w
+                        set tabNum to tabNum + 1
+                        if URL of t contains \"$domain\" then
+                            set active tab index of w to tabNum
+                            set index of w to 1
+                            return \"found\"
+                        end if
+                    end repeat
+                end repeat
+                return \"none\"
+            end tell
+        " 2>&1)
+
+        if [[ "$chrome_result" == "found" ]]; then
+            echo "Browse: Found and switched to existing tab"
+            activate_app "$browser"
+            return 0
+        elif [[ "$chrome_result" == "none" ]]; then
+            found_tab=true  # App supports browse, no matching tab
+        fi
+    fi
+
+    # Try Safari-style AppleScript (uses 'current tab' instead of 'active tab index')
+    if [[ "$found_tab" == false ]]; then
+        local safari_result
+        safari_result=$(osascript -e "
+            tell application \"$browser\"
+                repeat with w in windows
+                    repeat with t in tabs of w
+                        if URL of t contains \"$domain\" then
+                            set current tab of w to t
+                            set index of w to 1
+                            return \"found\"
+                        end if
+                    end repeat
+                end repeat
+                return \"none\"
+            end tell
+        " 2>&1)
+
+        if [[ "$safari_result" == "found" ]]; then
+            echo "Browse: Found and switched to existing tab"
+            activate_app "$browser"
+            return 0
+        elif [[ "$safari_result" == "none" ]]; then
+            found_tab=true  # App supports browse, no matching tab
+        fi
+    fi
+
+    # If no AppleScript approach worked, app doesn't support browse
+    if [[ "$found_tab" == false ]]; then
+        echo "ERROR: browse not supported for '$browser'" >&2
+        return 1
+    fi
+
+    # No existing tab found - open new tab and navigate
+    echo "Browse: No existing tab found, opening new tab"
+    activate_app "$browser"
+    sleep 0.2
+    key_combo "cmd+t"
+    sleep 0.2
+
+    # Ensure URL has protocol
+    if [[ ! "$target" =~ ^https?:// ]]; then
+        target="https://$target"
+    fi
+
+    # Paste URL (preserving user's clipboard)
+    local saved_clipboard=$(pbpaste 2>/dev/null)
+    printf '%s' "$target" | pbcopy 2>/dev/null
+    sleep 0.05
+    cliclick "kd:cmd" "t:v" "ku:cmd"
+    sleep 0.1
+    printf '%s' "$saved_clipboard" | pbcopy 2>/dev/null
+
+    press_key "return"
+
+    return 0
+}
+
 # Wait for a new window to appear and return the app info
 # Usage: wait_for_new_window [timeout_seconds]
 # Returns: Sets IN_APP to detected app and outputs app info
@@ -2840,6 +3023,17 @@ run_chain() {
                 key_combo "cmd+$tab_num"
                 wait_ms "$default_delay"
                 ;;
+            browse)
+                # Smart browse - find existing tab/window or open new one
+                # Works across Firefox, Safari, Chrome (URLs) and Finder (paths)
+                # Examples: browse:bsky.app, browse:github.com, browse:/Users/jay/Documents
+                echo "Chain: Browsing to '$arg'"
+                if ! browse_url "$arg" "$IN_APP"; then
+                    return 1
+                fi
+                wait_ms "$default_delay"
+                needs_auto_wait=1
+                ;;
             goto|goto-url)
                 # Navigate to URL/site, reusing existing tab if found
                 # Reads Firefox session file to find existing tabs (fast, reliable)
@@ -3379,6 +3573,10 @@ main() {
                 ;;
             --quit)
                 quit_app "$2"
+                shift 2
+                ;;
+            --browse)
+                browse_url "$2" || exit 1
                 shift 2
                 ;;
             --wait)

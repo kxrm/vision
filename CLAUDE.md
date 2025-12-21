@@ -197,7 +197,7 @@ Chains handle auto-waiting between steps:
 ./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:example.com" "key:return"
 ```
 
-Chain actions: `open`, `activate`, `wait`, `click`, `click-text`, `click-text-near`, `right-click-text`, `right-click-text-near`, `type`, `key`, `combo`, `scroll`, `page-top`, `page-bottom`, `back`, `back-no-close`, `forward`, `close-tab`, `screenshot`
+Chain actions: `browse`, `open`, `activate`, `wait`, `click`, `click-text`, `click-text-near`, `right-click-text`, `right-click-text-near`, `type`, `key`, `combo`, `scroll`, `page-top`, `page-bottom`, `back`, `back-no-close`, `forward`, `close-tab`, `screenshot`
 
 ### Rule 4: Multiple OCR Matches - Use `--near` for Disambiguation
 When multiple matches exist (common on list pages like Reddit, Hacker News), use `--near` to select by context.
@@ -215,16 +215,54 @@ When multiple matches exist (common on list pages like Reddit, Hacker News), use
 ./bin/interact.sh --in-app "App" --instance 2 --click-text "Submit"
 ```
 
-### Rule 5: Back Button Behavior
+### Rule 5: Use `browse:` for URL Navigation (STRONGLY PREFERRED)
+
+**Always use `browse:` when navigating to URLs in browsers.** This is the preferred method because it:
+- Finds existing tabs with matching domains instead of opening duplicates
+- Preserves the user's clipboard (saves/restores automatically)
+- Works across all major browsers (Firefox, Safari, Chrome, Brave, Edge, Arc)
+- Also works with Finder for file paths
+
+```bash
+# STRONGLY PREFERRED - reuses existing tab if domain matches
+./bin/interact.sh --in-app Firefox --browse "github.com"
+./bin/interact.sh --chain "in-app:Firefox" "browse:news.ycombinator.com"
+
+# AVOID - always opens new tab, clobbers clipboard
+./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+t" "paste:github.com" "key:return"
+```
+
+**How `browse:` works:**
+1. Searches open tabs for a matching domain (e.g., `github.com` matches `github.com/user/repo`)
+2. If found: switches to that tab (does NOT navigate within it - you're already on the right domain)
+3. If not found: opens new tab and navigates to the URL
+
+**Domain matching behavior:**
+- `browse:github.com` will find and switch to `https://github.com/anthropics/claude-code`
+- The tab stays on its current page - you orient from there (click links, use nav, etc.)
+- This preserves context (e.g., doesn't lose your place in a comments thread)
+
+**Finder support:**
+```bash
+# Opens existing Finder window at path, or opens new window
+./bin/interact.sh --browse "/Users/jay/Documents"
+./bin/interact.sh --chain "browse:/Users/jay/Downloads"
+```
+
+**Error handling:**
+- Returns error (exit 1) if the app doesn't support browse (not a browser or Finder)
+- Chain execution stops on browse failure
+
+### Rule 6: Back Button Behavior
 - `back` is smart by default: detects if navigation happened via window title change
   - If title changed → navigation worked, done
   - If title unchanged → no history, closes tab/window with `cmd+w` and shows WARNING
   - If app doesn't expose titles (e.g., System Settings) → shows ERROR, use explicit `close-tab`
 - `back-no-close` uses simple `cmd+[` without auto-close detection
 - For pages with anchor links, `back` may cycle through anchors instead of leaving page
-- Solution: Navigate directly with `combo:cmd+l` + `type:url` + `key:return`
+- Solution: Use `browse:` to navigate directly to the target domain
 
-### Rule 6: Grid Overlay for Coordinate Discovery
+### Rule 7: Grid Overlay for Coordinate Discovery
 When unsure about where to click:
 
 ```bash
@@ -232,7 +270,7 @@ When unsure about where to click:
 # View the _grid.jpg file to see percentage markers
 ```
 
-### Rule 7: Webcam PTZ Requires uvcc
+### Rule 8: Webcam PTZ Requires uvcc
 PTZ controls (`--pan`, `--tilt`, `--zoom`, `--look`) need:
 ```bash
 npm install -g uvcc
@@ -245,7 +283,10 @@ Without it, `snapshot.sh` still captures but can't control camera.
 
 ### Browse and Click Web Content
 ```bash
-./bin/interact.sh --in-app Firefox
+# Navigate to site (reuses existing tab if open)
+./bin/interact.sh --chain "in-app:Firefox" "browse:github.com"
+
+# Read page and interact
 ./bin/interact.sh --read-page Firefox                    # See what's visible
 ./bin/interact.sh --click-text "Sign In"                 # Click by text
 ./bin/interact.sh --click 45.2,67.8                      # Or by coordinates
@@ -253,7 +294,11 @@ Without it, `snapshot.sh` still captures but can't control camera.
 
 ### Navigate to URL
 ```bash
-./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "paste:reddit.com" "key:return" "wait:2000"
+# PREFERRED: browse finds existing tab or opens new one
+./bin/interact.sh --chain "in-app:Firefox" "browse:reddit.com"
+
+# Alternative if you need to force a specific URL (ignores existing tabs)
+./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "paste:reddit.com/r/programming" "key:return"
 ```
 
 ### Open File from Finder
@@ -315,19 +360,23 @@ For images, content is saved to `/tmp/clipboard_*.png` and path is returned.
 | Action | Speed | Clipboard | Use Case |
 |--------|-------|-----------|----------|
 | `type:text` | Slow (30ms/char) | Untouched | Short text, form fields |
-| `paste:text` | Fast (instant) | **Preserved** | URLs, long text, special chars |
+| `paste:text` | Fast (instant) | **Preserved** | Long text, special chars |
 | `copy-text:text` | Fast | **Clobbered** | When you need text in clipboard after |
 
 **LLM Guidance:**
-- Use `paste:` for URLs in address bar - faster and preserves user's clipboard
+- **For URLs: Use `browse:` instead** - it finds existing tabs and preserves clipboard
+- Use `paste:` for non-URL text that needs to be fast (long strings, special chars)
 - Use `type:` for short form inputs where paste might not work
 - Use `copy-text:` only when you intentionally want to leave content in clipboard
 
 ```bash
-# Recommended: Navigate to URL (preserves user's clipboard)
-./bin/interact.sh --chain "combo:cmd+l" "paste:https://example.com" "key:return"
+# BEST: Use browse for URLs (finds existing tabs, preserves clipboard)
+./bin/interact.sh --chain "in-app:Firefox" "browse:example.com"
 
-# Avoid: This clobbers whatever the user had copied
+# OK: Direct paste when you need a specific path (not just domain)
+./bin/interact.sh --chain "combo:cmd+l" "paste:https://example.com/specific/path" "key:return"
+
+# AVOID: This clobbers whatever the user had copied
 ./bin/interact.sh --chain "copy-text:https://example.com" "combo:cmd+l" "combo:cmd+v" "key:return"
 ```
 
