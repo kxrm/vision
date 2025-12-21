@@ -1,0 +1,8 @@
+# Vision Tools Python Dependencies
+# Install: pip install -r requirements.txt
+
+pillow>=12.0.0
+pyobjc-core>=12.0
+pyobjc-framework-Cocoa>=12.0
+pyobjc-framework-Quartz>=12.0
+lz4>=4.0.0
