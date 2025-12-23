@@ -13,12 +13,30 @@ GRID_OVERLAY="$LIB_DIR/grid_overlay.py"
 FORMAT="jpg"
 OUTPUT_DIR="/tmp"
 INCLUDE_CURSOR=""
+FULL_RES=""  # Set to skip resize (for OCR operations)
 
 # Generate timestamped filename
 generate_filename() {
     local prefix="${1:-screenshot}"
     local ext="${2:-$FORMAT}"
     echo "${OUTPUT_DIR}/${prefix}_$(date +%Y%m%d_%H%M%S).${ext}"
+}
+
+# Resize image for Claude API (max 1568px on longest dimension)
+# Anthropic API limits: 2000px for multi-image conversations, 1568px internal processing
+resize_for_claude() {
+    local file="$1"
+    if [[ -z "$file" || ! -f "$file" ]]; then
+        return 1
+    fi
+
+    local resize_py="$LIB_DIR/image_resize.py"
+    if [[ ! -f "$resize_py" ]]; then
+        # Silently skip if resize utility not available
+        return 0
+    fi
+
+    "$PYTHON" "$resize_py" "$file" 2>&1
 }
 
 # Check for Screen Recording permission
@@ -140,11 +158,15 @@ OPTIONS:
     --output <file>         Custom output filename
     --format <jpg|png>      Output format (default: jpg)
     --cursor                Include mouse cursor in capture
+    --full-res              Skip resize (for OCR - keeps original resolution)
     --grid [file]           Add grid overlay (to latest or specified file)
     --preview <x>,<y>       Screenshot display and show where click at x%,y% would land
                             (crosshairs overlay without moving cursor)
     --list-windows          List available windows with IDs
     --list-displays         List all displays with resolutions and offsets
+
+NOTE: Screenshots are resized to 1568px max by default (Anthropic API limit).
+      Use --full-res for OCR operations that need original resolution.
 
 EXAMPLES:
     ./screenshot.sh                      # Full screen capture
@@ -545,6 +567,10 @@ main() {
                 INCLUDE_CURSOR="1"
                 shift
                 ;;
+            --full-res)
+                FULL_RES="1"
+                shift
+                ;;
             --grid)
                 do_grid=true
                 if [[ -n "$2" && "$2" != --* ]]; then
@@ -611,6 +637,14 @@ main() {
         # Get the output file from the capture function
         local latest=$(find_latest_screenshot)
         add_grid "$latest"
+    fi
+
+    # Resize for Claude API unless --full-res was specified
+    if [[ -z "$FULL_RES" && $result -eq 0 ]]; then
+        local latest=$(find_latest_screenshot)
+        if [[ -n "$latest" ]]; then
+            resize_for_claude "$latest"
+        fi
     fi
 
     return $result

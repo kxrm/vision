@@ -37,6 +37,11 @@ DETECT_IMAGES=1
 TYPE_DELAY="${TYPE_DELAY:-30}"  # Default 30ms inter-character delay
 TYPE_FAST=""                     # Set to 1 for legacy cliclick behavior (faster but may trigger shortcuts)
 
+# Drag configuration (smooth, visible drags for web apps)
+DRAG_STEPS="${DRAG_STEPS:-20}"   # Number of intermediate points (more = smoother)
+DRAG_STEP_MS="${DRAG_STEP_MS:-25}"  # Milliseconds between steps (higher = slower, more visible)
+DRAG_EASING="${DRAG_EASING:-3}"  # cliclick easing factor (0=instant, higher=more natural)
+
 # Run a command with timeout (macOS compatible)
 # Usage: run_with_timeout <timeout_sec> <command> [args...]
 # Returns: command output on success, empty string on timeout
@@ -111,6 +116,69 @@ clear_target_app() {
 
 # Flag to suppress auto-read when inside a chain (chain handles it at the end)
 IN_CHAIN=""
+
+# Store focus region elements for positional click references in chains
+# Format: JSON array of {x, y, w, h} bounding boxes (app-relative coordinates)
+FOCUS_ELEMENTS=""
+
+# Get bounding box for element by positional reference
+# Usage: get_focus_element <position>
+# Position: left, left+N, right, right-N, top, top+N, bottom, bottom-N
+# Returns: x,y,w,h or empty if no match
+get_focus_element() {
+    local pos="$1"
+
+    if [[ -z "$FOCUS_ELEMENTS" || "$FOCUS_ELEMENTS" == "[]" ]]; then
+        echo "ERROR: No focus elements available. Use 'focus:x,y,w,h' first." >&2
+        return 1
+    fi
+
+    "$PYTHON" - "$FOCUS_ELEMENTS" "$pos" <<'PYEOF'
+import sys
+import json
+import re
+
+elements = json.loads(sys.argv[1])
+pos = sys.argv[2].lower().strip()
+
+if not elements:
+    sys.exit(1)
+
+# Parse position: direction[+/-offset]
+match = re.match(r'^(left|right|top|bottom)([+-]\d+)?$', pos)
+if not match:
+    print(f"ERROR: Invalid position '{pos}'. Use left, right, top, bottom with optional +/-N offset.", file=sys.stderr)
+    sys.exit(1)
+
+direction = match.group(1)
+offset_str = match.group(2)
+offset = int(offset_str) if offset_str else 0
+
+# Sort elements by position
+if direction in ('left', 'right'):
+    # Sort by x coordinate (center of element)
+    sorted_elems = sorted(elements, key=lambda e: e['x'] + e['w']/2)
+    if direction == 'right':
+        sorted_elems = sorted_elems[::-1]  # Reverse for right
+else:
+    # Sort by y coordinate (center of element)
+    sorted_elems = sorted(elements, key=lambda e: e['y'] + e['h']/2)
+    if direction == 'bottom':
+        sorted_elems = sorted_elems[::-1]  # Reverse for bottom
+
+# Apply offset (left+1 = second from left, right-1 = second from right)
+# For left/top: +N moves right/down in sorted order
+# For right/bottom: -N moves left/up in sorted order (already reversed)
+index = abs(offset)
+
+if index >= len(sorted_elems):
+    print(f"ERROR: Position offset {offset} out of range (only {len(sorted_elems)} elements)", file=sys.stderr)
+    sys.exit(1)
+
+elem = sorted_elems[index]
+print(f"{elem['x']},{elem['y']},{elem['w']},{elem['h']}")
+PYEOF
+}
 
 # Auto-read page after navigation actions when IN_APP is set
 # Call this at the end of click_grid, scroll_at, etc.
@@ -241,7 +309,7 @@ LLM-FRIENDLY FEATURES (automatic when --in-app is set):
       wait for page to stabilize - no manual wait: commands needed. Waits timeout
       after 3000ms (configurable via --auto-wait-timeout) with a warning, not a hang.
     • Auto-read: Chains and standalone clicks/scrolls automatically return page
-      content with clickable [x,y] coordinates
+      content with clickable [x,y,w,h] bounding boxes (use with --click or bubble --point-at)
     • Coord translation: Coordinates from --read-page and --click-text are
       app-relative and auto-translated by --click when --in-app is set
 
@@ -285,7 +353,13 @@ MOUSE ACTIONS:
     --double-click <x>,<y>    Double click at grid percentage
     --move <x>,<y>            Move mouse to grid percentage
     --move-pixel <x>,<y>      Move mouse to absolute pixel coordinates
-    --drag <x1>,<y1>,<x2>,<y2>  Drag from point to point (grid %)
+    --drag <coords>           Drag with smooth, visible movement (grid %)
+                              Formats: x1,y1,x2,y2 (point to point)
+                                       x1,y1,w,h,x2,y2 (box to point, auto-centers start)
+    --drag-text <text> <x>,<y>  Find text via OCR and drag to destination point
+    --drag-text-to-text <src> <tgt>  Find both texts and drag source onto target
+    --drag-speed <slow|normal|fast>  Set drag speed (default: normal)
+                              slow=50ms/step, normal=25ms/step, fast=10ms/step
     --nudge <dx>,<dy>         Nudge cursor by pixel offset (e.g., 0,-5 = up 5px)
     --scroll <dir> [amt] [x,y]  Scroll at position (dir: up/down/left/right, amt: units)
     --scroll-in-app <app> <dir> [amt]  Scroll within app's window (auto-finds display)
@@ -298,7 +372,7 @@ WINDOW QUERIES:
 
 OCR TEXT OPERATIONS:
     --click-text <text>       Find text on screen via OCR and click it
-    --find-text <text>        Find text and return its grid coordinates
+    --find-text <text>        Find text and return bounding box [x,y,w,h]
     --list-text               List all text visible on current display
     --read-page [app] [opts]  Extract all visible text in LLM-friendly format
                               App is optional if --in-app is set
@@ -306,7 +380,10 @@ OCR TEXT OPERATIONS:
                                        --json (structured JSON output)
                                        --save-screenshot <path>
                                        --no-images (skip image detection)
-    --near <text>             Select match closest to anchor text (place BEFORE --click-text)
+    --near <text>             Select match closest to anchor text (RECOMMENDED for disambiguation)
+                              Use when multiple matches exist - finds the one nearest to anchor.
+                              Example: --near "share save" --find-text "comments" finds "comments"
+                              in the action bar, not the header. Works with --click-text, --find-text.
     --instance <n>            Select Nth match by position (fallback, less reliable than --near)
     --in-app <app>            Set target app (persists across commands, auto-reactivates)
     --clear-target            Clear the persistent target app
@@ -320,6 +397,9 @@ UI ELEMENT OPERATIONS (accessibility-based, works with native macOS apps):
     --click-info <label>      Click info (i) button near text label
     --list-elements [type]    List interactive UI elements (toggle, button, info, slider)
                               Requires --in-app to be set. Types: toggle, button, info, slider
+    --focus <x,y,w,h>         Focus on region and detect UI elements (icons, buttons)
+                              x,y = top-left corner (%), w,h = size (%)
+                              Returns numbered elements with bounding boxes for --click
 
     When to use OCR vs Accessibility:
       • --click-text: Any visible text (links, menu items, button labels)
@@ -332,17 +412,32 @@ ATOMIC COMMAND CHAINS:
                               Format: "action:argument" (e.g., "open:Firefox")
                               Actions: open, activate, wait, click, click-text, click-text-near,
                                        type, key, combo, scroll, page-top, page-bottom, in-app,
-                                       switch-tab, goto, back, back-no-close, forward, up, home,
-                                       end, close-tab, select-next, select-prev, select-first,
+                                       focus, switch-tab, goto, back, back-no-close, forward, up,
+                                       home, end, close-tab, select-next, select-prev, select-first,
                                        select-last, open-selection, select-all, play-pause,
                                        next-track, prev-track, volume-up, volume-down, mute,
                                        brightness-up, brightness-down, screenshot, clipboard-read,
                                        copy-text, copy-image, copy-file, wait-for-text,
                                        wait-for-change, verify-text
+                              Focus+Click: focus:x,y,w,h - detect elements in region
+                                           click:left - click leftmost element
+                                           click:left+1 - click second from left
+                                           click:right - click rightmost element
+                                           click:right-1 - click second from right
+                                           click:top/bottom - click topmost/bottommost
+                                           Example: "focus:45,94,15,6" "click:left"
                               OCR clicks: click-text:X - click on text X
                                           click-text-near:X|Y - click text X nearest to Y
                                           right-click-text:X - right-click on text X
                                           right-click-text-near:X|Y - right-click X near Y
+                              Dragging: drag:x1,y1,x2,y2 - smooth drag between points
+                                        drag:x1,y1,w,h,x2,y2 - drag from box center to point
+                                        drag-text:text,x,y - find text and drag to point
+                                        drag-text-to-text:src|tgt - drag source to target
+                                        drag-focus:pos,x,y - drag focus element to point
+                                        drag-focus:from,to - drag between focus elements
+                                        drag-focus-to-text:pos|text - drag focus to OCR text
+                                        drag-to-focus:x,y,pos - drag from point to focus element
                               Navigation: back - smart back (auto-closes if no history)
                                           back-no-close - simple back (no auto-close)
                                           forward, up - browser/Finder navigation
@@ -473,7 +568,7 @@ ATOMIC CHAIN EXAMPLES:
     # Search and get results (auto-waits after each navigation)
     ./interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:duckduckgo.com" "key:return" \
                           "type:search query" "key:return"
-    # → Returns search results with [x,y] coordinates ready for --click
+    # → Returns search results with [x,y,w,h] bounding boxes ready for --click
 
     # Click on text (with auto-wait and auto-read)
     ./interact.sh --chain "in-app:Firefox" "click-text:68 comments"
@@ -622,6 +717,7 @@ check_cliclick() {
 }
 
 # Mouse click at grid coordinates
+# Accepts either point (x,y) or box (x,y,w,h) - box auto-clicks center
 click_grid() {
     local coords="$1"
     local click_type="${2:-c}"  # c=click, rc=right-click, dc=double-click
@@ -629,11 +725,19 @@ click_grid() {
     # Restore target app if set
     restore_target_app
 
-    IFS=',' read -r grid_x grid_y <<< "$coords"
+    # Parse coordinates - support both x,y and x,y,w,h formats
+    IFS=',' read -r grid_x grid_y grid_w grid_h <<< "$coords"
 
     if [[ -z "$grid_x" || -z "$grid_y" ]]; then
-        echo "ERROR: Invalid coordinates. Use format: x,y (e.g., 50,50)"
+        echo "ERROR: Invalid coordinates. Use format: x,y or x,y,w,h"
         return 1
+    fi
+
+    # If box format (x,y,w,h), calculate center point
+    if [[ -n "$grid_w" && -n "$grid_h" ]]; then
+        grid_x=$(awk "BEGIN {printf \"%.1f\", $grid_x + $grid_w / 2}")
+        grid_y=$(awk "BEGIN {printf \"%.1f\", $grid_y + $grid_h / 2}")
+        echo "Box coords → center ($grid_x,$grid_y)" >&2
     fi
 
     # Translate app-relative coords to display-relative when IN_APP is set
@@ -740,15 +844,64 @@ move_mouse() {
     cliclick "m:$cli_x,$cli_y" "m:$cli_nudge_x,$cli_y" "m:$cli_x,$cli_y"
 }
 
-# Drag from point to point
+# Drag from point to point with smooth, visible movement
+# Uses intermediate points so web apps register the drag properly
+# Supports two formats:
+#   x1,y1,x2,y2       - point to point
+#   x1,y1,w1,h1,x2,y2 - box (auto-centered) to point
 drag_mouse() {
     local coords="$1"
 
-    IFS=',' read -r x1 y1 x2 y2 <<< "$coords"
+    # Parse coordinates - support both formats
+    IFS=',' read -r v1 v2 v3 v4 v5 v6 <<< "$coords"
+
+    local x1 y1 x2 y2
+
+    if [[ -n "$v5" && -n "$v6" ]]; then
+        # 6 values: x,y,w,h,x2,y2 - box to point format
+        # Calculate center of start box
+        x1=$(awk "BEGIN {printf \"%.1f\", $v1 + $v3 / 2}")
+        y1=$(awk "BEGIN {printf \"%.1f\", $v2 + $v4 / 2}")
+        x2="$v5"
+        y2="$v6"
+        echo "Start box → center ($x1,$y1)" >&2
+    else
+        # 4 values: x1,y1,x2,y2 - point to point format
+        x1="$v1"
+        y1="$v2"
+        x2="$v3"
+        y2="$v4"
+    fi
 
     if [[ -z "$x1" || -z "$y1" || -z "$x2" || -z "$y2" ]]; then
-        echo "ERROR: Invalid coordinates. Use format: x1,y1,x2,y2"
+        echo "ERROR: Invalid coordinates. Use format: x1,y1,x2,y2 or x1,y1,w1,h1,x2,y2"
         return 1
+    fi
+
+    # Restore target app if set
+    restore_target_app
+
+    # Translate app-relative coords to display-relative when IN_APP is set
+    if [[ -n "$IN_APP" ]]; then
+        local where=$("$PYTHON" "$WINDOW_LIST" --app "$IN_APP" --where 2>&1)
+        if ! echo "$where" | grep -q "No window found"; then
+            local bounds=$(echo "$where" | grep "^BOUNDS:" | sed 's/BOUNDS: //')
+            if [[ -n "$bounds" ]]; then
+                IFS=',' read -r win_x win_y win_w win_h <<< "$bounds"
+
+                # Translate start point: App-relative % → display-relative %
+                local abs_x1=$(awk "BEGIN {print int($win_x + $x1 * $win_w / 100)}")
+                local abs_y1=$(awk "BEGIN {print int($win_y + $y1 * $win_h / 100)}")
+                x1=$(awk "BEGIN {printf \"%.1f\", ($abs_x1 - $DISPLAY_X_OFFSET) * 100 / $DISPLAY_WIDTH}")
+                y1=$(awk "BEGIN {printf \"%.1f\", ($abs_y1 - $DISPLAY_Y_OFFSET) * 100 / $DISPLAY_HEIGHT}")
+
+                # Translate end point: App-relative % → display-relative %
+                local abs_x2=$(awk "BEGIN {print int($win_x + $x2 * $win_w / 100)}")
+                local abs_y2=$(awk "BEGIN {print int($win_y + $y2 * $win_h / 100)}")
+                x2=$(awk "BEGIN {printf \"%.1f\", ($abs_x2 - $DISPLAY_X_OFFSET) * 100 / $DISPLAY_WIDTH}")
+                y2=$(awk "BEGIN {printf \"%.1f\", ($abs_y2 - $DISPLAY_Y_OFFSET) * 100 / $DISPLAY_HEIGHT}")
+            fi
+        fi
     fi
 
     local start=$(grid_to_pixel "$x1" "$y1")
@@ -760,7 +913,203 @@ drag_mouse() {
     local ey=$(echo "$end" | awk '{print $2}')
 
     echo "Dragging from ($x1%, $y1%) to ($x2%, $y2%)"
-    cliclick "dd:$sx,$sy" "du:$ex,$ey"
+
+    # Build command with intermediate points for smooth, visible drag
+    local steps=${DRAG_STEPS:-20}
+    local step_ms=${DRAG_STEP_MS:-25}
+    local easing=${DRAG_EASING:-3}
+
+    # Calculate deltas
+    local dx=$((ex - sx))
+    local dy=$((ey - sy))
+
+    # Build cliclick command array
+    local cmd_args=()
+    cmd_args+=("-e" "$easing")
+    cmd_args+=("-w" "$step_ms")
+
+    # Move to start position first
+    cmd_args+=("m:$sx,$sy")
+
+    # Mouse down at start
+    cmd_args+=("dd:$sx,$sy")
+
+    # Generate intermediate points (using integer math)
+    for ((i=1; i<=steps; i++)); do
+        # Calculate position at step i (linear interpolation)
+        local px=$((sx + (dx * i / steps)))
+        local py=$((sy + (dy * i / steps)))
+        cmd_args+=("dm:$px,$py")
+    done
+
+    # Mouse up at end
+    cmd_args+=("du:$ex,$ey")
+
+    # Execute the smooth drag
+    cliclick "${cmd_args[@]}"
+}
+
+# Drag from OCR text to a point
+# Usage: drag_text "Search Text" x,y (destination)
+drag_text() {
+    local search_text="$1"
+    local dest="$2"
+    local instance="${INSTANCE:-1}"
+    local in_app="${IN_APP:-}"
+
+    echo "Finding text to drag: '$search_text'..."
+
+    # Find text using OCR
+    local coords_file="/tmp/drag_text_coords_$$.txt"
+    local find_timeout="${OCR_TIMEOUT:-10}"
+
+    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$search_text" "$instance" "$DISPLAY_NUM" "$in_app" "$NEAR_TEXT" > "$coords_file" ) &
+    local find_pid=$!
+
+    # Wait with timeout
+    local waited=0
+    while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+
+    if kill -0 $find_pid 2>/dev/null; then
+        pkill -P $find_pid 2>/dev/null
+        kill $find_pid 2>/dev/null
+        wait $find_pid 2>/dev/null
+        rm -f "$coords_file"
+        echo "ERROR: Text search timed out"
+        return 1
+    fi
+
+    wait $find_pid
+    local coords=$(cat "$coords_file" 2>/dev/null)
+    rm -f "$coords_file"
+
+    if [[ -z "$coords" || "$coords" == *"NOT_FOUND"* || "$coords" == *"ERROR"* ]]; then
+        echo "ERROR: Text not found: '$search_text'"
+        return 1
+    fi
+
+    echo "Found '$search_text' at: $coords"
+
+    # Parse source coords (may be x,y or x,y,w,h)
+    IFS=',' read -r sx sy sw sh <<< "$coords"
+
+    # Parse destination (x,y)
+    IFS=',' read -r dx dy <<< "$dest"
+
+    if [[ -z "$dx" || -z "$dy" ]]; then
+        echo "ERROR: Invalid destination. Use format: x,y"
+        return 1
+    fi
+
+    # Build drag coords - if we have a box, use box format; otherwise point format
+    if [[ -n "$sw" && -n "$sh" ]]; then
+        drag_mouse "$sx,$sy,$sw,$sh,$dx,$dy"
+    else
+        drag_mouse "$sx,$sy,$dx,$dy"
+    fi
+}
+
+# Drag from one OCR text to another OCR text
+# Usage: drag_text_to_text "Source Text" "Target Text"
+drag_text_to_text() {
+    local source_text="$1"
+    local target_text="$2"
+    local source_instance="${SOURCE_INSTANCE:-1}"
+    local target_instance="${TARGET_INSTANCE:-1}"
+    local in_app="${IN_APP:-}"
+
+    echo "Dragging '$source_text' to '$target_text'..."
+
+    # Find source text
+    local coords_file="/tmp/drag_text_src_$$.txt"
+    local find_timeout="${OCR_TIMEOUT:-10}"
+
+    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$source_text" "$source_instance" "$DISPLAY_NUM" "$in_app" "$NEAR_TEXT" > "$coords_file" ) &
+    local find_pid=$!
+
+    local waited=0
+    while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+
+    if kill -0 $find_pid 2>/dev/null; then
+        pkill -P $find_pid 2>/dev/null
+        kill $find_pid 2>/dev/null
+        wait $find_pid 2>/dev/null
+        rm -f "$coords_file"
+        echo "ERROR: Source text search timed out"
+        return 1
+    fi
+
+    wait $find_pid
+    local source_coords=$(cat "$coords_file" 2>/dev/null)
+    rm -f "$coords_file"
+
+    if [[ -z "$source_coords" || "$source_coords" == *"NOT_FOUND"* || "$source_coords" == *"ERROR"* ]]; then
+        echo "ERROR: Source text not found: '$source_text'"
+        return 1
+    fi
+
+    echo "Found source '$source_text' at: $source_coords"
+
+    # Find target text
+    coords_file="/tmp/drag_text_tgt_$$.txt"
+
+    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$target_text" "$target_instance" "$DISPLAY_NUM" "$in_app" "" > "$coords_file" ) &
+    find_pid=$!
+
+    waited=0
+    while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+
+    if kill -0 $find_pid 2>/dev/null; then
+        pkill -P $find_pid 2>/dev/null
+        kill $find_pid 2>/dev/null
+        wait $find_pid 2>/dev/null
+        rm -f "$coords_file"
+        echo "ERROR: Target text search timed out"
+        return 1
+    fi
+
+    wait $find_pid
+    local target_coords=$(cat "$coords_file" 2>/dev/null)
+    rm -f "$coords_file"
+
+    if [[ -z "$target_coords" || "$target_coords" == *"NOT_FOUND"* || "$target_coords" == *"ERROR"* ]]; then
+        echo "ERROR: Target text not found: '$target_text'"
+        return 1
+    fi
+
+    echo "Found target '$target_text' at: $target_coords"
+
+    # Parse source coords (x,y,w,h)
+    IFS=',' read -r sx sy sw sh <<< "$source_coords"
+
+    # Parse target coords to get center point
+    IFS=',' read -r tx ty tw th <<< "$target_coords"
+
+    # Calculate target center
+    local dest_x dest_y
+    if [[ -n "$tw" && -n "$th" ]]; then
+        dest_x=$(awk "BEGIN {printf \"%.1f\", $tx + $tw / 2}")
+        dest_y=$(awk "BEGIN {printf \"%.1f\", $ty + $th / 2}")
+    else
+        dest_x="$tx"
+        dest_y="$ty"
+    fi
+
+    # Build drag coords
+    if [[ -n "$sw" && -n "$sh" ]]; then
+        drag_mouse "$sx,$sy,$sw,$sh,$dest_x,$dest_y"
+    else
+        drag_mouse "$sx,$sy,$dest_x,$dest_y"
+    fi
 }
 
 # Type text using Python/Quartz with inter-character delays
@@ -1276,9 +1625,9 @@ wait_for_text() {
     while [[ $elapsed -lt $timeout ]]; do
         # Take screenshot
         if [[ -n "$app" ]]; then
-            "$SCREENSHOT" --in-app "$app" --output "$temp_screenshot" > /dev/null 2>&1
+            "$SCREENSHOT" --in-app "$app" --output "$temp_screenshot" --full-res > /dev/null 2>&1
         else
-            "$SCREENSHOT" --output "$temp_screenshot" > /dev/null 2>&1
+            "$SCREENSHOT" --output "$temp_screenshot" --full-res > /dev/null 2>&1
         fi
 
         # Run OCR to find text
@@ -1353,11 +1702,11 @@ verify_text() {
 
     local temp_screenshot="/tmp/verify_text_$$.jpg"
 
-    # Take screenshot
+    # Take screenshot (full-res for OCR accuracy)
     if [[ -n "$app" ]]; then
-        "$SCREENSHOT" --in-app "$app" --output "$temp_screenshot" > /dev/null 2>&1
+        "$SCREENSHOT" --in-app "$app" --output "$temp_screenshot" --full-res > /dev/null 2>&1
     else
-        "$SCREENSHOT" --output "$temp_screenshot" > /dev/null 2>&1
+        "$SCREENSHOT" --output "$temp_screenshot" --full-res > /dev/null 2>&1
     fi
 
     local found=""
@@ -1866,282 +2215,37 @@ find_text_on_screen() {
     restore_target_app
     in_app="${in_app:-$IN_APP}"  # Update in case restore_target_app set it
 
-    local temp_screenshot="/tmp/ocr_screenshot_$$.jpg"
-
-    # If filtering by app, get the window location FIRST to determine correct display
-    local bounds=""
+    # Activate the app to ensure it's visible for the screenshot
     if [[ -n "$in_app" ]]; then
-        local where_output=$("$PYTHON" "$WINDOW_LIST" --app "$in_app" --where 2>&1)
-        if [[ $? -ne 0 ]]; then
-            echo "ERROR: Could not find window for app: $in_app"
-            return 1
-        fi
-
-        # Parse display number and bounds from --where output
-        local app_display=$(echo "$where_output" | grep "^DISPLAY:" | sed 's/DISPLAY: //' | awk '{print $1}')
-        bounds=$(echo "$where_output" | grep "^BOUNDS:" | sed 's/BOUNDS: //')
-
-        # Debug output
-        [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: app_display='$app_display' bounds='$bounds'" >&2
-
-        # Use the app's display for screenshot
-        if [[ -n "$app_display" ]]; then
-            display="$app_display"
-        fi
-
-        # Activate the app to ensure it's visible for the screenshot
         activate_app "$in_app" > /dev/null 2>&1
         sleep 0.3
     fi
 
-    # Take screenshot of the target display (even when in_app is set, we use display
-    # screenshot so coordinates match display-absolute bounds for filtering)
-    [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: Taking screenshot for display='$display'" >&2
+    # Build find_text.py command
+    local find_args=("$search_text")
+    [[ -n "$in_app" ]] && find_args+=(--in-app "$in_app")
+    [[ -n "$near_text" ]] && find_args+=(--near "$near_text")
+    [[ -n "$instance" && -z "$near_text" ]] && find_args+=(--instance "$instance")
+    [[ -n "$display" ]] && find_args+=(--display "$display")
 
-    if [[ -n "$display" ]]; then
-        "$SCREENSHOT" --display "$display" --output "$temp_screenshot" > /dev/null 2>&1
-    else
-        "$SCREENSHOT" --output "$temp_screenshot" > /dev/null 2>&1
-    fi
-
-    [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: screenshot exists=$(test -f "$temp_screenshot" && echo yes || echo no)" >&2
-
-    if [[ ! -f "$temp_screenshot" ]]; then
-        echo "ERROR: Failed to capture screenshot for OCR"
-        return 1
-    fi
-
-    # If filtering by app, filter OCR results to window bounds
-    if [[ -n "$in_app" ]]; then
-
-        # Parse bounds: x,y,w,h (pixel coordinates in absolute screen coords)
-        IFS=',' read -r win_x win_y win_w win_h <<< "$bounds"
-
-        # Get display offset so we can convert window bounds to display-relative coords
-        # The screenshot is for a single display, so OCR coords are display-relative
-        local disp_offset_x=0
-        local disp_offset_y=0
-        if [[ -n "$display" ]]; then
-            local disp_info=$("$PYTHON" << PYEOF
-import Quartz
-max_displays = 10
-(err, active_displays, num_displays) = Quartz.CGGetActiveDisplayList(max_displays, None, None)
-if err == 0:
-    for i, display_id in enumerate(active_displays[:num_displays]):
-        if i + 1 == $display:
-            bounds = Quartz.CGDisplayBounds(display_id)
-            print(f"{int(bounds.origin.x)},{int(bounds.origin.y)}")
-            break
-PYEOF
-)
-            IFS=',' read -r disp_offset_x disp_offset_y <<< "$disp_info"
-        fi
-
-        # Convert window bounds to display-relative coordinates
-        local rel_win_x=$((win_x - disp_offset_x))
-        local rel_win_y=$((win_y - disp_offset_y))
-
-        [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: bounds parsed: x=$win_x y=$win_y w=$win_w h=$win_h" >&2
-        [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: display offset: x=$disp_offset_x y=$disp_offset_y" >&2
-        [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: relative bounds: x=$rel_win_x y=$rel_win_y w=$win_w h=$win_h" >&2
-
-        # Get all matches and filter by window bounds (with timeout)
-        local temp_json="/tmp/ocr_matches_$$.json"
-        local ocr_timeout=$(( (AUTO_WAIT_TIMEOUT + 2000) / 1000 ))
-
-        # When using --near with --in-app, take app-only screenshot
-        # screenshot.sh --in-app now captures without shadow, matching window bounds exactly
-        local ocr_screenshot="$temp_screenshot"
-        local app_screenshot=""
-        if [[ -n "$near_text" ]]; then
-            app_screenshot="/tmp/ocr_app_$$.jpg"
-            if "$SCREENSHOT" --in-app "$in_app" --output "$app_screenshot" > /dev/null 2>&1; then
-                ocr_screenshot="$app_screenshot"
-                [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: Using app-only screenshot for --near" >&2
-            fi
-        fi
-
-        # Build OCR command with optional --near for proximity search
-        local ocr_cmd=("$PYTHON" "$OCR_FIND" "$ocr_screenshot" --find "$search_text")
-        if [[ -n "$near_text" ]]; then
-            ocr_cmd+=(--near "$near_text" --json)
-            [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: Using --near '$near_text'" >&2
-        else
-            ocr_cmd+=(--all --json)
-            [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: No near_text, using --all" >&2
-        fi
-        run_with_timeout "$ocr_timeout" "${ocr_cmd[@]}" > "$temp_json"
-        local ocr_status=$?
-
-        [[ -n "$DEBUG_OCR" ]] && echo "DEBUG: ocr_status=$ocr_status json_size=$(wc -c < "$temp_json" 2>/dev/null)" >&2
-        [[ -n "$DEBUG_OCR" ]] && cat "$temp_json" >&2
-
-        rm -f "$temp_screenshot"
-        [[ -n "$app_screenshot" && -f "$app_screenshot" ]] && rm -f "$app_screenshot"
-
-        if [[ $ocr_status -eq 124 ]]; then
-            rm -f "$temp_json"
-            echo "ERROR: OCR timed out after ${ocr_timeout}s"
-            return 1
-        fi
-
-        if [[ $ocr_status -ne 0 ]]; then
-            rm -f "$temp_json"
-            echo "NOT_FOUND: '$search_text'"
-            return 1
-        fi
-
-        # Filter matches to those within the app window using Python
-        # Note: OCR pixel coords are in screenshot resolution (may be Retina 2x)
-        # Window bounds are in logical points - need to account for scale factor
-        # If using app-only screenshot (for --near), coords are already window-relative
-        local is_app_screenshot=0
-        [[ -n "$app_screenshot" && "$ocr_screenshot" == "$app_screenshot" ]] && is_app_screenshot=1
-        local filtered
-        filtered=$("$PYTHON" - "$temp_json" "$rel_win_x" "$rel_win_y" "$win_w" "$win_h" "$instance" "$is_app_screenshot" << 'PYEOF'
-import json
-import sys
-
-json_file = sys.argv[1]
-win_x, win_y, win_w, win_h = int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
-instance = int(sys.argv[6])
-is_app_screenshot = int(sys.argv[7]) if len(sys.argv) > 7 else 0
-
-with open(json_file) as f:
-    data = json.load(f)
-
-# Handle both single object (from --near) and list of objects
-if isinstance(data, dict):
-    matches = [data]  # Wrap single object in list
-else:
-    matches = data
-
-# If using app-only screenshot, coords are already window-relative
-# screenshot.sh --in-app now captures without shadow, matching window bounds
-if is_app_screenshot and matches:
-    m = matches[0]  # --near returns single best match
-    # center_pct is already window-relative percentage
-    app_pct_x = m['center_pct']['x']
-    app_pct_y = m['center_pct']['y']
-    print(f"{app_pct_x:.1f},{app_pct_y:.1f}")
-    sys.exit(0)
-
-# Standard flow: filter by window bounds and convert to app-relative coords
-# Detect Retina scale factor from screenshot vs display dimensions
-scale = 1
-if matches:
-    img_w = matches[0].get('image_size', {}).get('width', 0)
-    img_h = matches[0].get('image_size', {}).get('height', 0)
-    if img_w > 0 and img_h > 0:
-        # Query actual display dimensions from macOS
-        import Quartz
-        max_displays = 10
-        err, displays, count = Quartz.CGGetActiveDisplayList(max_displays, None, None)
-        if err == 0 and count > 0:
-            # Use main display (or could match by display number)
-            display_id = displays[0]
-            bounds = Quartz.CGDisplayBounds(display_id)
-            logical_w = bounds.size.width
-            logical_h = bounds.size.height
-            # Scale is screenshot pixels / logical points
-            if logical_w > 0:
-                scale = round(img_w / logical_w)
-
-# Scale window bounds to match screenshot pixel coordinates
-win_x *= scale
-win_y *= scale
-win_w *= scale
-win_h *= scale
-
-filtered = []
-for m in matches:
-    px = m['center_px']['x']
-    py = m['center_px']['y']
-    # Check if point is within window bounds (both now in pixel coords)
-    if win_x <= px <= win_x + win_w and win_y <= py <= win_y + win_h:
-        filtered.append(m)
-
-if filtered:
-    # If multiple matches and instance not explicitly set, error with helpful message
-    import os
-    instance_explicit = os.environ.get('INSTANCE_EXPLICIT', '')
-    if len(filtered) > 1 and not instance_explicit:
-        print(f"MULTIPLE_MATCHES: Found {len(filtered)} matches. Use --near to select by context (recommended):", file=sys.stderr)
-        for i, m in enumerate(filtered, 1):
-            px = m['center_px']['x']
-            py = m['center_px']['y']
-            app_pct_x = (px - win_x) / win_w * 100
-            app_pct_y = (py - win_y) / win_h * 100
-            text_preview = m.get('text', '')[:40]
-            print(f"  {i}. \"{text_preview}\" at ({app_pct_x:.1f}%,{app_pct_y:.1f}%)", file=sys.stderr)
-        print(f"Tip: --near \"nearby text\" selects closest match, or --instance N as fallback", file=sys.stderr)
-        sys.exit(1)
-
-    # Get requested instance (1-indexed)
-    idx = instance - 1
-    if idx < len(filtered):
-        m = filtered[idx]
-        # Convert to app-relative coordinates (since we filtered by app window)
-        # This allows click_grid to translate correctly when IN_APP is set
-        px = m['center_px']['x']
-        py = m['center_px']['y']
-        app_pct_x = (px - win_x) / win_w * 100
-        app_pct_y = (py - win_y) / win_h * 100
-        print(f"{app_pct_x:.1f},{app_pct_y:.1f}")
-    else:
-        print(f"ERROR: Only {len(filtered)} matches in window, requested instance {instance}", file=sys.stderr)
-        sys.exit(1)
-else:
-    print("NOT_FOUND", file=sys.stderr)
-    sys.exit(1)
-PYEOF
-)
-        local filter_status=$?
-        rm -f "$temp_json"
-
-        if [[ $filter_status -ne 0 ]]; then
-            echo "NOT_FOUND: '$search_text' in $in_app window"
-            return 1
-        fi
-
-        echo "$filtered"
-        return 0
-    fi
-
-    # Standard OCR without app filtering (with timeout)
-    local ocr_output
+    # Run find_text.py with timeout
     local ocr_timeout=$(( (AUTO_WAIT_TIMEOUT + 2000) / 1000 ))
+    local result
+    result=$(run_with_timeout "$ocr_timeout" "$PYTHON" "$LIB_DIR/find_text.py" "${find_args[@]}" 2>&1)
+    local status=$?
 
-    # Build OCR command with optional --near for proximity search
-    if [[ -n "$near_text" ]]; then
-        ocr_output=$(run_with_timeout "$ocr_timeout" "$PYTHON" "$OCR_FIND" "$temp_screenshot" --find "$search_text" --near "$near_text")
-    else
-        ocr_output=$(run_with_timeout "$ocr_timeout" "$PYTHON" "$OCR_FIND" "$temp_screenshot" --find "$search_text" --instance "$instance")
-    fi
-    local ocr_status=$?
-
-    # Clean up
-    rm -f "$temp_screenshot"
-
-    if [[ $ocr_status -eq 124 ]]; then
+    if [[ $status -eq 124 ]]; then
         echo "ERROR: OCR timed out after ${ocr_timeout}s"
         return 1
     fi
 
-    if [[ $ocr_status -ne 0 ]]; then
-        echo "NOT_FOUND: '$search_text'"
+    if [[ $status -ne 0 ]]; then
+        # Pass through error message from find_text.py
+        echo "$result"
         return 1
     fi
 
-    # Parse the output to get grid coordinates
-    local grid_line=$(echo "$ocr_output" | grep "^GRID:")
-    if [[ -z "$grid_line" ]]; then
-        echo "ERROR: Could not parse OCR output"
-        return 1
-    fi
-
-    local coords=$(echo "$grid_line" | sed 's/GRID: //')
-    echo "$coords"
+    echo "$result"
     return 0
 }
 
@@ -2291,6 +2395,148 @@ list_elements() {
     fi
 }
 
+# Focus on a region and detect UI elements (icons, buttons)
+# Usage: focus_region <x,y,w,h> - percentages defining region to analyze
+# Returns numbered elements with bounding boxes in app-relative coordinates
+focus_region() {
+    local region="$1"
+    local app="${IN_APP:-}"
+
+    if [[ -z "$app" ]]; then
+        echo "ERROR: --in-app must be set to use --focus" >&2
+        return 1
+    fi
+
+    # Parse region: x,y,w,h (all percentages)
+    IFS=',' read -r reg_x reg_y reg_w reg_h <<< "$region"
+
+    if [[ -z "$reg_x" || -z "$reg_y" || -z "$reg_w" || -z "$reg_h" ]]; then
+        echo "ERROR: --focus requires region as x,y,w,h (percentages)" >&2
+        echo "Example: --focus 40,90,30,10 (30% wide, 10% tall region centered at 40%,90%)" >&2
+        return 1
+    fi
+
+    # Take screenshot of app
+    local screenshot
+    screenshot=$("$SCRIPT_DIR/screenshot.sh" --in-app "$app" --full-res 2>/dev/null | grep "^/tmp/" | head -1)
+    if [[ ! -f "$screenshot" ]]; then
+        echo "ERROR: Failed to capture screenshot" >&2
+        return 1
+    fi
+
+    # Get image dimensions and crop region
+    local cropped="/tmp/focus_region_$(date +%Y%m%d_%H%M%S).jpg"
+
+    # Use Python to crop and run element detection
+    "$PYTHON" - "$screenshot" "$reg_x" "$reg_y" "$reg_w" "$reg_h" "$cropped" <<'PYEOF'
+import sys
+from PIL import Image
+
+screenshot_path = sys.argv[1]
+reg_x = float(sys.argv[2])
+reg_y = float(sys.argv[3])
+reg_w = float(sys.argv[4])
+reg_h = float(sys.argv[5])
+cropped_path = sys.argv[6]
+
+img = Image.open(screenshot_path)
+width, height = img.size
+
+# Convert percentages to pixels
+x1 = int(reg_x * width / 100)
+y1 = int(reg_y * height / 100)
+x2 = int((reg_x + reg_w) * width / 100)
+y2 = int((reg_y + reg_h) * height / 100)
+
+# Crop and save (convert to RGB for JPEG compatibility)
+cropped = img.crop((x1, y1, x2, y2))
+if cropped.mode == 'RGBA':
+    cropped = cropped.convert('RGB')
+cropped.save(cropped_path, quality=95)
+print(cropped_path)
+PYEOF
+
+    if [[ ! -f "$cropped" ]]; then
+        echo "ERROR: Failed to crop region" >&2
+        return 1
+    fi
+
+    # Run element detection on cropped region
+    local elements
+    elements=$("$PYTHON" "$LIB_DIR/element_detect.py" --image "$cropped" --json 2>/dev/null)
+
+    if [[ -z "$elements" || "$elements" == "[]" ]]; then
+        echo "@focus $app region:$region"
+        echo "No elements detected in region"
+        echo "---"
+        return 0
+    fi
+
+    # Output header
+    echo "@focus $app region:$region"
+    echo "Image: $cropped"
+
+    # Transform element coordinates from region-relative to app-relative
+    # Output both human-readable format AND JSON for FOCUS_ELEMENTS
+    local transformed
+    transformed=$("$PYTHON" - "$elements" "$reg_x" "$reg_y" "$reg_w" "$reg_h" <<'PYEOF'
+import sys
+import json
+
+elements = json.loads(sys.argv[1])
+reg_x = float(sys.argv[2])
+reg_y = float(sys.argv[3])
+reg_w = float(sys.argv[4])
+reg_h = float(sys.argv[5])
+
+output_lines = []
+json_elements = []
+
+for elem in elements:
+    # Element bbox is relative to cropped region (0-100%)
+    # Convert to app-relative coordinates
+    ex, ey, ew, eh = elem['bbox']
+
+    # Scale and offset to app coordinates
+    app_x = reg_x + (ex * reg_w / 100)
+    app_y = reg_y + (ey * reg_h / 100)
+    app_w = ew * reg_w / 100
+    app_h = eh * reg_h / 100
+
+    # Human-readable format: [id] x,y,w,h type
+    output_lines.append(f"[{elem['id']}] {app_x:.1f},{app_y:.1f},{app_w:.1f},{app_h:.1f} {elem['type']}")
+
+    # JSON format for FOCUS_ELEMENTS
+    json_elements.append({
+        'id': elem['id'],
+        'x': round(app_x, 1),
+        'y': round(app_y, 1),
+        'w': round(app_w, 1),
+        'h': round(app_h, 1),
+        'type': elem['type']
+    })
+
+# Output human-readable lines
+for line in output_lines:
+    print(line)
+
+# Output JSON on special marker line for parsing
+print(f"__FOCUS_JSON__:{json.dumps(json_elements)}")
+PYEOF
+)
+
+    # Parse output: print human-readable lines, extract JSON for FOCUS_ELEMENTS
+    while IFS= read -r line; do
+        if [[ "$line" == __FOCUS_JSON__:* ]]; then
+            FOCUS_ELEMENTS="${line#__FOCUS_JSON__:}"
+        else
+            echo "$line"
+        fi
+    done <<< "$transformed"
+
+    echo "---"
+}
+
 # Read page - extract all visible text in LLM-friendly format
 # Usage: read_page <app> [--classify] [--json] [--save-screenshot <path>]
 read_page() {
@@ -2320,7 +2566,8 @@ read_page() {
     sleep 0.3
 
     local temp_screenshot="/tmp/read_page_$$.jpg"
-    "$SCREENSHOT" --in-app "$app" --output "$temp_screenshot" > /dev/null 2>&1
+    # Use --full-res for OCR accuracy (resize happens later in image_detect for extracted images)
+    "$SCREENSHOT" --in-app "$app" --output "$temp_screenshot" --full-res > /dev/null 2>&1
 
     if [[ ! -f "$temp_screenshot" ]]; then
         echo "ERROR: Failed to capture screenshot" >&2
@@ -2350,8 +2597,15 @@ read_page() {
         image_output=$("$PYTHON" "$IMAGE_DETECT" "$temp_screenshot" --json 2>/dev/null)
     fi
 
+    # Get bubble position if running (for LLM awareness of obscured areas)
+    local bubble_info=""
+    local bubble_script="${SCRIPT_DIR}/bubble.sh"
+    if [[ -f "$bubble_script" ]]; then
+        bubble_info=$("$bubble_script" --get-position 2>/dev/null | grep "^@bubble" || echo "")
+    fi
+
     # Format output using Python
-    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" << 'PYEOF'
+    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" << 'PYEOF'
 import json
 import sys
 
@@ -2363,6 +2617,7 @@ win_h = sys.argv[5]
 classify = sys.argv[6] == "true"
 json_output = sys.argv[7] == "true"
 image_json = sys.argv[8] if len(sys.argv) > 8 else ""
+bubble_info = sys.argv[9] if len(sys.argv) > 9 else ""
 
 # Parse text elements from OCR
 try:
@@ -2381,22 +2636,23 @@ elements = []
 for e in text_elements:
     elements.append({
         'type': 'text',
-        'center_pct': e.get('center_pct', {}),
+        'bounds_pct': e.get('bounds_pct', {}),
         'text': e.get('text', '')
     })
 
 for img in image_elements:
     elements.append({
         'type': 'image',
-        'center_pct': img.get('center_pct', {}),
+        'bounds_pct': img.get('bounds_pct', {}),
         'path': img.get('path', ''),
         'description': img.get('description', 'Image')
     })
 
 # Sort by position (top-to-bottom, left-to-right reading order)
 def sort_key(e):
-    y = e.get('center_pct', {}).get('y', 0)
-    x = e.get('center_pct', {}).get('x', 0)
+    b = e.get('bounds_pct', {})
+    y = b.get('y', 0)
+    x = b.get('x', 0)
     return (round(y / 5) * 5, x)  # Group by ~5% vertical bands
 
 elements.sort(key=sort_key)
@@ -2413,35 +2669,44 @@ if json_output:
         "elements": []
     }
     for e in elements:
-        x = round(e.get('center_pct', {}).get('x', 0), 1)
-        y = round(e.get('center_pct', {}).get('y', 0), 1)
+        b = e.get('bounds_pct', {})
+        x = round(b.get('x', 0), 1)
+        y = round(b.get('y', 0), 1)
+        w = round(b.get('width', 0), 1)
+        h = round(b.get('height', 0), 1)
         if e['type'] == 'image':
             elem = {
-                "g": [x, y],
+                "b": [x, y, w, h],
                 "type": "image",
                 "path": e.get('path', ''),
                 "desc": e.get('description', '')
             }
         else:
             elem = {
-                "g": [x, y],
+                "b": [x, y, w, h],
                 "t": e.get('text', '')
             }
         output["elements"].append(elem)
     print(json.dumps(output, indent=2))
 else:
-    # Line-oriented format
+    # Line-oriented format: [x,y,w,h] where x,y is top-left corner
     print(f"@page {app} display:{display} viewport:{win_w}x{win_h}")
+    # Include bubble position info if running (helps LLM avoid obscured areas)
+    if bubble_info:
+        print(bubble_info)
     for e in elements:
-        x = round(e.get('center_pct', {}).get('x', 0), 1)
-        y = round(e.get('center_pct', {}).get('y', 0), 1)
+        b = e.get('bounds_pct', {})
+        x = round(b.get('x', 0), 1)
+        y = round(b.get('y', 0), 1)
+        w = round(b.get('width', 0), 1)
+        h = round(b.get('height', 0), 1)
         if e['type'] == 'image':
             path = e.get('path', '')
             desc = e.get('description', 'Image')
-            print(f"[{x},{y}] [IMAGE:{path} \"{desc}\"]")
+            print(f"[{x},{y},{w},{h}] [IMAGE:{path} \"{desc}\"]")
         else:
             text = e.get('text', '')
-            print(f"[{x},{y}] {text}")
+            print(f"[{x},{y},{w},{h}] {text}")
     print("---")
     print(f"elements:{text_count} images:{image_count}")
 PYEOF
@@ -2457,7 +2722,7 @@ list_screen_text() {
 
     local screenshot_cmd="$SCREENSHOT"
     [[ -n "$display" ]] && screenshot_cmd="$screenshot_cmd --display $display"
-    screenshot_cmd="$screenshot_cmd --output $temp_screenshot"
+    screenshot_cmd="$screenshot_cmd --output $temp_screenshot --full-res"
 
     $screenshot_cmd > /dev/null 2>&1
 
@@ -2555,9 +2820,29 @@ run_chain() {
                 echo "Chain: Waiting ${arg}ms"
                 wait_ms "$arg"
                 ;;
+            focus)
+                # Focus on region and detect elements for positional clicking
+                # Usage: focus:x,y,w,h (percentages)
+                # Stores detected elements in FOCUS_ELEMENTS for click:left/right/top/bottom
+                echo "Chain: Focusing on region $arg"
+                FOCUS_ELEMENTS=""  # Clear previous focus
+                focus_region "$arg"
+                wait_ms "$default_delay"
+                ;;
             click)
-                echo "Chain: Clicking at $arg"
-                click_grid "$arg" "c"
+                # Check if arg is a positional reference (left, right, top, bottom)
+                local click_coords="$arg"
+                if [[ "$arg" =~ ^(left|right|top|bottom) ]]; then
+                    echo "Chain: Resolving positional click '$arg'"
+                    click_coords=$(get_focus_element "$arg")
+                    if [[ $? -ne 0 || -z "$click_coords" ]]; then
+                        echo "Chain: FAILED - could not resolve position '$arg'" >&2
+                        return 1
+                    fi
+                    echo "Chain: Resolved to $click_coords"
+                fi
+                echo "Chain: Clicking at $click_coords"
+                click_grid "$click_coords" "c"
                 wait_ms "$default_delay"
                 needs_auto_wait=1  # Navigation action - auto-wait for page change
                 ;;
@@ -2608,6 +2893,184 @@ run_chain() {
             right-click)
                 echo "Chain: Right-clicking at $arg"
                 click_grid "$arg" "rc"
+                wait_ms "$default_delay"
+                ;;
+            drag)
+                # Format: drag:x1,y1,x2,y2 or drag:x1,y1,w,h,x2,y2 (box to point)
+                echo "Chain: Dragging $arg"
+                drag_mouse "$arg"
+                wait_ms "$default_delay"
+                ;;
+            drag-text)
+                # Format: drag-text:text,x,y - find text and drag to point
+                local drag_search="${arg%%,*}"
+                local drag_dest="${arg#*,}"
+                # Split remaining arg on first comma to get x,y
+                if [[ "$drag_search" == "$drag_dest" || -z "$drag_dest" ]]; then
+                    echo "Chain: ERROR - drag-text requires format: text,x,y" >&2
+                    return 1
+                fi
+                echo "Chain: Dragging '$drag_search' to $drag_dest${IN_APP:+ (in $IN_APP)}"
+                drag_text "$drag_search" "$drag_dest"
+                wait_ms "$default_delay"
+                ;;
+            drag-text-to-text)
+                # Format: drag-text-to-text:source|target - drag source text to target text
+                local drag_source="${arg%%|*}"
+                local drag_target="${arg#*|}"
+                if [[ "$drag_source" == "$drag_target" || -z "$drag_target" ]]; then
+                    echo "Chain: ERROR - drag-text-to-text requires format: source|target" >&2
+                    return 1
+                fi
+                echo "Chain: Dragging '$drag_source' to '$drag_target'${IN_APP:+ (in $IN_APP)}"
+                drag_text_to_text "$drag_source" "$drag_target"
+                wait_ms "$default_delay"
+                ;;
+            drag-focus)
+                # Drag a focus-detected element
+                # Formats:
+                #   drag-focus:pos,x,y     - drag element to coordinates
+                #   drag-focus:from,to     - drag between two elements (positions or IDs)
+                local parts=()
+                IFS=',' read -ra parts <<< "$arg"
+
+                if [[ ${#parts[@]} -eq 3 ]]; then
+                    # Format: position,x,y - drag element to coordinates
+                    local src_pos="${parts[0]}"
+                    local dest_x="${parts[1]}"
+                    local dest_y="${parts[2]}"
+
+                    local src_coords
+                    src_coords=$(get_focus_element "$src_pos")
+                    if [[ $? -ne 0 ]]; then
+                        echo "Chain: ERROR - Failed to resolve focus position '$src_pos'" >&2
+                        return 1
+                    fi
+
+                    echo "Chain: Dragging focus '$src_pos' to $dest_x,$dest_y"
+                    drag_mouse "$src_coords,$dest_x,$dest_y"
+
+                elif [[ ${#parts[@]} -eq 2 ]]; then
+                    # Format: from,to - drag between elements
+                    local src_pos="${parts[0]}"
+                    local dest_pos="${parts[1]}"
+
+                    local src_coords
+                    src_coords=$(get_focus_element "$src_pos")
+                    if [[ $? -ne 0 ]]; then
+                        echo "Chain: ERROR - Failed to resolve focus position '$src_pos'" >&2
+                        return 1
+                    fi
+
+                    local dest_coords
+                    dest_coords=$(get_focus_element "$dest_pos")
+                    if [[ $? -ne 0 ]]; then
+                        echo "Chain: ERROR - Failed to resolve focus position '$dest_pos'" >&2
+                        return 1
+                    fi
+
+                    # Extract destination center from x,y,w,h
+                    local dest_x dest_y dest_w dest_h
+                    IFS=',' read -r dest_x dest_y dest_w dest_h <<< "$dest_coords"
+                    local dest_center_x=$(awk "BEGIN {printf \"%.1f\", $dest_x + $dest_w / 2}")
+                    local dest_center_y=$(awk "BEGIN {printf \"%.1f\", $dest_y + $dest_h / 2}")
+
+                    echo "Chain: Dragging focus '$src_pos' to '$dest_pos'"
+                    drag_mouse "$src_coords,$dest_center_x,$dest_center_y"
+                else
+                    echo "Chain: ERROR - drag-focus requires format: pos,x,y or from,to" >&2
+                    return 1
+                fi
+                wait_ms "$default_delay"
+                ;;
+            drag-focus-to-text)
+                # Format: drag-focus-to-text:position|target_text
+                # Drag a focus-detected element to OCR text
+                local src_pos="${arg%%|*}"
+                local target_text="${arg#*|}"
+
+                if [[ "$src_pos" == "$target_text" || -z "$target_text" ]]; then
+                    echo "Chain: ERROR - drag-focus-to-text requires format: position|text" >&2
+                    return 1
+                fi
+
+                local src_coords
+                src_coords=$(get_focus_element "$src_pos")
+                if [[ $? -ne 0 ]]; then
+                    echo "Chain: ERROR - Failed to resolve focus position '$src_pos'" >&2
+                    return 1
+                fi
+
+                echo "Chain: Dragging focus '$src_pos' to text '$target_text'"
+
+                # Find target text using OCR
+                local coords_file="/tmp/drag_focus_text_$$.txt"
+                local find_timeout="${OCR_TIMEOUT:-10}"
+
+                ( INSTANCE_EXPLICIT=1 find_text_on_screen "$target_text" "${INSTANCE:-1}" "$DISPLAY_NUM" "$IN_APP" "$NEAR_TEXT" > "$coords_file" ) &
+                local find_pid=$!
+
+                local waited=0
+                while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
+                    sleep 0.2
+                    waited=$((waited + 1))
+                done
+
+                if kill -0 $find_pid 2>/dev/null; then
+                    pkill -P $find_pid 2>/dev/null
+                    kill $find_pid 2>/dev/null
+                    wait $find_pid 2>/dev/null
+                    rm -f "$coords_file"
+                    echo "Chain: ERROR - Text search timed out" >&2
+                    return 1
+                fi
+
+                wait $find_pid
+                local target_coords=$(cat "$coords_file" 2>/dev/null)
+                rm -f "$coords_file"
+
+                if [[ -z "$target_coords" || "$target_coords" == *"NOT_FOUND"* || "$target_coords" == *"ERROR"* ]]; then
+                    echo "Chain: ERROR - Text not found: '$target_text'" >&2
+                    return 1
+                fi
+
+                # Extract target center from x,y,w,h
+                local tx ty tw th
+                IFS=',' read -r tx ty tw th <<< "$target_coords"
+                local target_center_x=$(awk "BEGIN {printf \"%.1f\", $tx + ${tw:-0} / 2}")
+                local target_center_y=$(awk "BEGIN {printf \"%.1f\", $ty + ${th:-0} / 2}")
+
+                drag_mouse "$src_coords,$target_center_x,$target_center_y"
+                wait_ms "$default_delay"
+                ;;
+            drag-to-focus)
+                # Format: drag-to-focus:x,y,position
+                # Drag from coordinates to a focus-detected element
+                local src_x="${arg%%,*}"
+                local rest="${arg#*,}"
+                local src_y="${rest%%,*}"
+                local dest_pos="${rest#*,}"
+
+                if [[ -z "$src_x" || -z "$src_y" || -z "$dest_pos" || "$src_y" == "$dest_pos" ]]; then
+                    echo "Chain: ERROR - drag-to-focus requires format: x,y,position" >&2
+                    return 1
+                fi
+
+                local dest_coords
+                dest_coords=$(get_focus_element "$dest_pos")
+                if [[ $? -ne 0 ]]; then
+                    echo "Chain: ERROR - Failed to resolve focus position '$dest_pos'" >&2
+                    return 1
+                fi
+
+                # Extract destination center from x,y,w,h
+                local dest_x dest_y dest_w dest_h
+                IFS=',' read -r dest_x dest_y dest_w dest_h <<< "$dest_coords"
+                local dest_center_x=$(awk "BEGIN {printf \"%.1f\", $dest_x + $dest_w / 2}")
+                local dest_center_y=$(awk "BEGIN {printf \"%.1f\", $dest_y + $dest_h / 2}")
+
+                echo "Chain: Dragging $src_x,$src_y to focus '$dest_pos'"
+                drag_mouse "$src_x,$src_y,$dest_center_x,$dest_center_y"
                 wait_ms "$default_delay"
                 ;;
             double-click)
@@ -3453,6 +3916,15 @@ main() {
     # Initialize to main display by default
     get_main_display
 
+    # Pre-scan for --instance to set INSTANCE_EXPLICIT early
+    # This ensures --find-text works correctly regardless of argument order
+    for arg in "$@"; do
+        if [[ "$arg" == "--instance" ]]; then
+            export INSTANCE_EXPLICIT=1
+            break
+        fi
+    done
+
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --display)
@@ -3524,6 +3996,35 @@ main() {
             --drag)
                 drag_mouse "$2"
                 shift 2
+                ;;
+            --drag-speed)
+                case "$2" in
+                    slow)
+                        DRAG_STEP_MS=50
+                        DRAG_STEPS=30
+                        ;;
+                    normal)
+                        DRAG_STEP_MS=25
+                        DRAG_STEPS=20
+                        ;;
+                    fast)
+                        DRAG_STEP_MS=10
+                        DRAG_STEPS=15
+                        ;;
+                    *)
+                        echo "ERROR: --drag-speed must be slow, normal, or fast"
+                        exit 1
+                        ;;
+                esac
+                shift 2
+                ;;
+            --drag-text)
+                drag_text "$2" "$3"
+                shift 3
+                ;;
+            --drag-text-to-text)
+                drag_text_to_text "$2" "$3"
+                shift 3
                 ;;
             --type)
                 local fast_flag=""
@@ -3791,6 +4292,14 @@ main() {
                     list_elements ""
                     shift
                 fi
+                ;;
+            --focus)
+                if [[ -z "$2" || "$2" == --* ]]; then
+                    echo "ERROR: --focus requires region as x,y,w,h (percentages)" >&2
+                    exit 1
+                fi
+                focus_region "$2"
+                shift 2
                 ;;
             --read-page)
                 local rp_app=""
