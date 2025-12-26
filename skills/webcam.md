@@ -28,7 +28,16 @@ Capture webcam photos and control pan/tilt/zoom for Insta360 Link 2 cameras.
 | `--look <pan> <tilt>` | Set pan and tilt together | |
 | `--center` | Center camera on user | |
 | `--reset` | Reset to center with 1x zoom | |
-| `--status` | Show current position | |
+| `--ptz` | Show current position (formatted) | |
+| `--position` | Show raw position (for calibration) | |
+
+## Calculation Helpers (for LLM navigation)
+
+| Argument | Description |
+|----------|-------------|
+| `--calc-frame <L%> <T%> <R%> <B%> [margin%]` | Calculate framing from bounding box |
+| `--calc-adjust <x%> <y%> [zoom%]` | Calculate pan/tilt to center object |
+| `--calc-zoom <obj%> [target%] [zoom%]` | Calculate zoom for object height |
 
 ## Requirements
 

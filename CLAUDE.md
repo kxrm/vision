@@ -198,14 +198,22 @@ Without `--in-app`, OCR searches the ENTIRE screen and will find text in wrong w
 - **Without --in-app**: Coordinates are display-relative (full screen)
 - `--read-page` returns app-relative coordinates that work directly with `--click`
 
-### Rule 3: Use Chains for Multi-Step Navigation
+### Rule 3: Use Chains for Multi-Step Operations
 Chains handle auto-waiting between steps:
 
 ```bash
 ./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:example.com" "key:return"
 ```
 
-Chain actions: `browse`, `open`, `activate`, `wait`, `click`, `click-text`, `click-text-near`, `right-click-text`, `right-click-text-near`, `focus`, `drag`, `drag-text`, `drag-text-to-text`, `drag-focus`, `drag-focus-to-text`, `drag-to-focus`, `type`, `key`, `combo`, `scroll`, `page-top`, `page-bottom`, `back`, `back-no-close`, `forward`, `close-tab`, `screenshot`
+Chain actions: `browse`, `open`, `activate`, `wait`, `click`, `click-text`, `click-text-near`, `right-click-text`, `right-click-text-near`, `drag`, `arc`, `dragend`, `drag-easing`, `drag-steps`, `type`, `key`, `combo`, `scroll`, `page-top`, `page-bottom`, `back`, `back-no-close`, `forward`, `close-tab`, `screenshot`
+
+**LLM Guidance - When to use chains:**
+If you already know you need multiple sequential actions, use a single `--chain` command instead of separate commands. Common patterns:
+- **Combining elements**: Two drags to the same destination → `--chain "drag:src1,dest" "drag:src2,dest"`
+- **Form filling**: Multiple fields → `--chain "click:x,y" "type:value" "click:x2,y2" "type:value2"`
+- **Navigation + action**: → `--chain "browse:url" "wait:1000" "click-text:Button"`
+
+Think of it like shell commands: if you'd write `cmd1 && cmd2 && cmd3`, use `--chain "action1" "action2" "action3"`.
 
 ### Rule 4: Multiple OCR Matches - Use `--near` for Disambiguation
 When multiple matches exist (common on list pages like Reddit, Hacker News), use `--near` to select by context.
@@ -270,7 +278,68 @@ When multiple matches exist (common on list pages like Reddit, Hacker News), use
 - For pages with anchor links, `back` may cycle through anchors instead of leaving page
 - Solution: Use `browse:` to navigate directly to the target domain
 
-### Rule 7: Grid Overlay for Coordinate Discovery
+### Rule 7: Use `--aspect` for Geometric Drawing
+When drawing shapes that must be geometrically correct (circles, squares), use `--aspect` to work in a square coordinate space. Without it, percentages map differently in X vs Y on non-square windows/regions.
+
+```bash
+# Read page with aspect-corrected coordinates
+./bin/interact.sh --in-app Firefox --aspect --read-page
+
+# Click using aspect coordinates (matches read-page output)
+./bin/interact.sh --in-app Firefox --aspect --click 50,50
+
+# Draw in a specific region (canvas area within the app window)
+./bin/interact.sh --in-app Firefox --aspect 5,38,56,79 --drag 20,20,80,80
+```
+
+**How it works:**
+- `--aspect` (no args): Uses a centered square within the app window based on `min(width, height)`
+- `--aspect x1,y1,x2,y2`: Uses a centered square within the specified region
+- Coordinates from `--read-page --aspect` work directly with `--click --aspect` and `--drag --aspect`
+
+### Rule 8: Arc Drags for Curved Shapes
+Use `--arc` with `--drag` to draw curved paths. Combine with `--aspect` for geometrically correct shapes.
+
+```bash
+# Draw a perfect circle (4 quarter arcs, auto-chained)
+./bin/interact.sh --in-app Firefox --aspect 5,38,56,79 --chain \
+  "drag:80,50,50,20" "arc:-90:0" \
+  "drag:50,20,20,50" "arc:-90:0" \
+  "drag:20,50,50,80" "arc:-90:0" \
+  "drag:50,80,80,50" "arc:-90:0"
+```
+
+**Arc syntax:** `arc:<position>:<tension>`
+- **Position** (±1 to ±179): Sign = direction (+ left, - right), magnitude = arc angle
+- **Tension**: 0 = true circle, negative = flatter, positive = sharper (L-corner)
+
+**Chain behaviors:**
+- **Batching**: Consecutive drags are batched into a single Python call for smooth, pause-free motion
+- **Easing**: Only applies at chain boundaries (ease-in at start, ease-out at end). Middle segments use linear motion
+- **`dragend:`**: Releases mouse mid-chain to draw disconnected elements in one command
+
+**Using `dragend:` for multi-element drawings:**
+```bash
+# Draw a smiley face in ONE chain (no connecting lines between elements)
+./bin/interact.sh --in-app Firefox --aspect 5,38,56,79 --chain \
+  "drag:85,50,50,15" "arc:-90:0" "drag:50,15,15,50" "arc:-90:0" \
+  "drag:15,50,50,85" "arc:-90:0" "drag:50,85,85,50" "arc:-90:0" \
+  "dragend:" \
+  "drag:42,40,35,33" "arc:-90:0" "drag:35,33,28,40" "arc:-90:0" \
+  "drag:28,40,35,47" "arc:-90:0" "drag:35,47,42,40" "arc:-90:0" \
+  "dragend:" \
+  "drag:72,40,65,33" "arc:-90:0" "drag:65,33,58,40" "arc:-90:0" \
+  "drag:58,40,65,47" "arc:-90:0" "drag:65,47,72,40" "arc:-90:0" \
+  "dragend:" \
+  "drag:30,65,70,65" "arc:-40:0"
+```
+
+**Common shapes:**
+- **Circle**: 4 quarter arcs with `arc:-90:0` (or `arc:90:0` for opposite direction)
+- **Flower/pinwheel**: Alternating `arc:-60:0` and `arc:60:0` for curved petals
+- **Star**: Straight drags connecting outer and inner points
+
+### Rule 9: Grid Overlay for Coordinate Discovery
 When unsure about where to click:
 
 ```bash
@@ -278,12 +347,49 @@ When unsure about where to click:
 # View the _grid.jpg file to see percentage markers
 ```
 
-### Rule 8: Webcam PTZ Requires uvcc
+### Rule 10: Webcam PTZ Requires uvcc
 PTZ controls (`--pan`, `--tilt`, `--zoom`, `--look`) need:
 ```bash
 npm install -g uvcc
 ```
 Without it, `snapshot.sh` still captures but can't control camera.
+
+### Rule 11: OCR Output is Your Primary Vision for Text
+
+**OCR output is your primary "vision" for text content.** The auto-read from `--read-page`, `--click`, `--drag`, and other interact.sh commands returns OCR text - this IS you reading the page. Don't redundantly screenshot.
+
+Use screenshots only when you need:
+- Visual layout understanding (where are elements positioned spatially?)
+- To see actual images/graphics (photos, charts, icons)
+- Coordinate discovery with `--grid`
+- To show the user what you're seeing
+
+**Anti-pattern to avoid:**
+```bash
+./bin/interact.sh --read-page "App"     # Already gives you text
+./bin/screenshot.sh --in-app "App"       # Redundant
+Read /tmp/screenshot_*.jpg               # Redundant
+```
+
+**Correct pattern:**
+```bash
+./bin/interact.sh --read-page "App"     # This is sufficient for text
+# Only screenshot if you need visual/spatial information
+```
+
+### Rule 12: Problem-Solving Over Task Completion
+
+When encountering a blocker (paywall, login wall, error), **scan available context for solutions before moving on.** Comments, surrounding text, and previous output often contain workarounds.
+
+**Anti-pattern:** "Article is paywalled, moving on" (while ignoring gift link in comments)
+
+**Correct pattern:**
+1. Encounter blocker
+2. Check if solution exists in current context (comments, links, alternative URLs)
+3. Act on solution if found
+4. Only skip if no solution available
+
+Prioritize **thoroughness over throughput** - completing a task partially 5 times is worse than completing it fully 4 times.
 
 ---
 
@@ -338,24 +444,98 @@ Without it, `snapshot.sh` still captures but can't control camera.
 ./bin/interact.sh --chain "in-app:Firefox" "scroll:down,page"
 ```
 
-### Drag Operations
+### Drag Operations (Region-Filtered Workflow)
+
+**The recommended workflow for drag-and-drop:**
+
+1. **Set region filter** to scope to the interactive area (exclude sidebars, headers):
 ```bash
-# Drag between coordinates
-./bin/interact.sh --drag 20,30,50,60                    # Point to point
-./bin/interact.sh --chain "drag:20,30,50,60"            # Same in chain
-
-# Drag using OCR text
-./bin/interact.sh --drag-text-to-text "Fire" "Water"    # Drag text to text
-./bin/interact.sh --chain "drag-text-to-text:Fire|Water"
-
-# Drag using focus detection (for icons/elements without text)
-./bin/interact.sh --chain "focus:10,40,30,30" "drag-focus:left,right"  # Between elements
-./bin/interact.sh --chain "focus:10,40,30,30" "drag-focus:1,50,50"     # Element to point
-./bin/interact.sh --chain "focus:10,40,30,30" "drag-focus-to-text:left|Trash"  # To text
-./bin/interact.sh --chain "focus:60,40,30,30" "drag-to-focus:20,20,right"      # From point
+./bin/interact.sh --in-app Firefox --region 0,10,75,95
 ```
 
-**Focus-based drag is for elements without text labels** (icons, image thumbnails, graphical UI). Use `focus:x,y,w,h` to detect elements in a region, then drag using positional references (`left`, `right`, `top`, `bottom`) or element IDs.
+2. **Read page** to get element coordinates:
+```bash
+./bin/interact.sh --read-page
+# Output: [11.2,49.0,7.7,2.0] Fire
+#         [25.3,62.1,8.1,2.0] Water
+```
+
+3. **Drag using bounding box coordinates** (auto-calculates center):
+```bash
+./bin/interact.sh --drag 11.2,49.0,7.7,2.0,25.3,62.1
+# Drags from center of "Fire" box to center of "Water" position
+```
+
+4. **Auto-read shows result** with same region filter applied.
+
+**Coordinate formats:**
+- `x1,y1,x2,y2` - Point to point (4 values)
+- `x1,y1,w,h,x2,y2` - Box center to point (6 values, first 4 = source box)
+
+**Why this is better than text-based drag:**
+- LLM sees all candidates before deciding
+- No OCR disambiguation errors (sidebar vs canvas)
+- Works for icons once icon detection is added
+- Region filter persists across commands
+
+**Speed control:**
+```bash
+./bin/interact.sh --drag-speed slow   # 2.5s, very deliberate
+./bin/interact.sh --drag-speed normal # 1.6s (default)
+./bin/interact.sh --drag-speed fast   # 0.6s, quick
+```
+
+**Easing and precision control:**
+```bash
+./bin/interact.sh --drag-easing linear      # Constant speed (best for drawing)
+./bin/interact.sh --drag-easing ease-in-out # Natural motion (default)
+./bin/interact.sh --drag-steps 100          # More interpolation steps (default: 60)
+```
+
+### Arc Drag (Curved Paths)
+
+Draw curves instead of straight lines using `--arc position:tension`:
+
+```bash
+# Basic arc (curves left)
+./bin/interact.sh --arc 90:0 --drag 20,50,80,50
+
+# In chains (arc modifies following drag)
+./bin/interact.sh --chain "drag:20,50,80,50" "arc:90:0"
+```
+
+**Arc parameters:**
+- **Position** (±1 to ±179): Controls direction and arc angle
+  - Sign: `+` curves left of travel, `-` curves right
+  - Magnitude: arc angle in degrees (`90` = quarter circle)
+- **Tension**: Shape control
+  - `0` = **TRUE circular arc** (mathematically perfect, uses parametric equations)
+  - Negative = straighter (Bézier approximation)
+  - Positive = sharper L-corner (Bézier approximation)
+
+**Drawing circles (4 quarter-arcs):**
+```bash
+# Circle: use NEGATIVE position to curve outward (right of travel = outside)
+./bin/interact.sh --in-app Firefox --drag-easing linear --drag-steps 100 --chain \
+  "drag:47,57,32,42" "arc:-90:0" \
+  "drag:32,42,17,57" "arc:-90:0" \
+  "drag:17,57,32,72" "arc:-90:0" \
+  "drag:32,72,47,57" "arc:-90:0"
+# Note: For perfect circles, use square aspect ratio or calculate pixel-accurate points
+```
+
+**Auto-chaining:** Consecutive drags in a chain automatically stay connected:
+- First drag: mouse down, drag, hold
+- Subsequent drags: continue from current position, hold
+- Last drag (or `dragend:`): release mouse
+
+```bash
+# Three connected line segments (one continuous stroke)
+./bin/interact.sh --chain "drag:10,10,50,10" "drag:50,10,50,50" "drag:50,50,10,50"
+
+# Explicit release mid-chain
+./bin/interact.sh --chain "drag:10,10,50,50" "dragend" "drag:60,60,90,90"
+```
 
 ### Media Control
 ```bash

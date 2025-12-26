@@ -37,10 +37,23 @@ DETECT_IMAGES=1
 TYPE_DELAY="${TYPE_DELAY:-30}"  # Default 30ms inter-character delay
 TYPE_FAST=""                     # Set to 1 for legacy cliclick behavior (faster but may trigger shortcuts)
 
-# Drag configuration (smooth, visible drags for web apps)
-DRAG_STEPS="${DRAG_STEPS:-20}"   # Number of intermediate points (more = smoother)
-DRAG_STEP_MS="${DRAG_STEP_MS:-25}"  # Milliseconds between steps (higher = slower, more visible)
-DRAG_EASING="${DRAG_EASING:-3}"  # cliclick easing factor (0=instant, higher=more natural)
+# Drag configuration (smooth, human-like drags using Quartz)
+DRAG_DURATION="${DRAG_DURATION:-1.6}"  # Total drag duration in seconds (higher = slower, more visible)
+DRAG_EASING="${DRAG_EASING:-ease-in-out}"  # Easing: linear, ease-in, ease-out, ease-in-out
+DRAG_STEPS="${DRAG_STEPS:-60}"  # Number of interpolation steps (higher = smoother)
+
+# Arc drag parameters (set via --arc position:tension)
+ARC_POSITION=""   # ±1 to ±179: sign=direction, magnitude=apex location
+ARC_TENSION=""    # Shape: negative=straighter, 0=circle, positive=L-corner
+
+# Drag chaining state (for continuous paths in chains)
+DRAG_MOUSE_DOWN=""  # Set to "1" when mouse is held from previous drag
+
+# Region filter for --read-page output (persistent, set via --region x1,y1,x2,y2)
+REGION=""
+
+# Aspect ratio correction (for drawing shapes with equal proportions)
+ASPECT_CORRECT=""  # Set to "1" to use square coordinate space
 
 # Run a command with timeout (macOS compatible)
 # Usage: run_with_timeout <timeout_sec> <command> [args...]
@@ -117,69 +130,6 @@ clear_target_app() {
 # Flag to suppress auto-read when inside a chain (chain handles it at the end)
 IN_CHAIN=""
 
-# Store focus region elements for positional click references in chains
-# Format: JSON array of {x, y, w, h} bounding boxes (app-relative coordinates)
-FOCUS_ELEMENTS=""
-
-# Get bounding box for element by positional reference
-# Usage: get_focus_element <position>
-# Position: left, left+N, right, right-N, top, top+N, bottom, bottom-N
-# Returns: x,y,w,h or empty if no match
-get_focus_element() {
-    local pos="$1"
-
-    if [[ -z "$FOCUS_ELEMENTS" || "$FOCUS_ELEMENTS" == "[]" ]]; then
-        echo "ERROR: No focus elements available. Use 'focus:x,y,w,h' first." >&2
-        return 1
-    fi
-
-    "$PYTHON" - "$FOCUS_ELEMENTS" "$pos" <<'PYEOF'
-import sys
-import json
-import re
-
-elements = json.loads(sys.argv[1])
-pos = sys.argv[2].lower().strip()
-
-if not elements:
-    sys.exit(1)
-
-# Parse position: direction[+/-offset]
-match = re.match(r'^(left|right|top|bottom)([+-]\d+)?$', pos)
-if not match:
-    print(f"ERROR: Invalid position '{pos}'. Use left, right, top, bottom with optional +/-N offset.", file=sys.stderr)
-    sys.exit(1)
-
-direction = match.group(1)
-offset_str = match.group(2)
-offset = int(offset_str) if offset_str else 0
-
-# Sort elements by position
-if direction in ('left', 'right'):
-    # Sort by x coordinate (center of element)
-    sorted_elems = sorted(elements, key=lambda e: e['x'] + e['w']/2)
-    if direction == 'right':
-        sorted_elems = sorted_elems[::-1]  # Reverse for right
-else:
-    # Sort by y coordinate (center of element)
-    sorted_elems = sorted(elements, key=lambda e: e['y'] + e['h']/2)
-    if direction == 'bottom':
-        sorted_elems = sorted_elems[::-1]  # Reverse for bottom
-
-# Apply offset (left+1 = second from left, right-1 = second from right)
-# For left/top: +N moves right/down in sorted order
-# For right/bottom: -N moves left/up in sorted order (already reversed)
-index = abs(offset)
-
-if index >= len(sorted_elems):
-    print(f"ERROR: Position offset {offset} out of range (only {len(sorted_elems)} elements)", file=sys.stderr)
-    sys.exit(1)
-
-elem = sorted_elems[index]
-print(f"{elem['x']},{elem['y']},{elem['w']},{elem['h']}")
-PYEOF
-}
-
 # Auto-read page after navigation actions when IN_APP is set
 # Call this at the end of click_grid, scroll_at, etc.
 # Skipped when IN_CHAIN is set (chain does auto-read at end instead)
@@ -193,8 +143,8 @@ auto_read_page() {
         local read_output=""
         local read_pid
 
-        # Start read_page in background
-        read_page "$IN_APP" &
+        # Start read_page in background (pass REGION if set)
+        read_page "$IN_APP" "false" "false" "" "$REGION" &
         read_pid=$!
 
         # Wait with timeout
@@ -273,13 +223,27 @@ get_main_display() {
 
 # Convert grid percentage to absolute pixel coordinates
 # Returns coordinates formatted for cliclick (with = prefix for negative values)
+# When ASPECT_CORRECT is set, uses a centered square coordinate space
 grid_to_pixel() {
     local grid_x="$1"
     local grid_y="$2"
 
-    # Calculate position within display, then add offset
-    local rel_x=$(echo "$grid_x * $DISPLAY_WIDTH / 100" | bc)
-    local rel_y=$(echo "$grid_y * $DISPLAY_HEIGHT / 100" | bc)
+    local rel_x rel_y
+
+    if [[ -n "$ASPECT_CORRECT" ]]; then
+        # Use square coordinate space (centered)
+        # Find smaller dimension, center the square region
+        local min_dim=$((DISPLAY_WIDTH < DISPLAY_HEIGHT ? DISPLAY_WIDTH : DISPLAY_HEIGHT))
+        local center_offset_x=$(( (DISPLAY_WIDTH - min_dim) / 2 ))
+        local center_offset_y=$(( (DISPLAY_HEIGHT - min_dim) / 2 ))
+
+        rel_x=$(echo "$center_offset_x + $grid_x * $min_dim / 100" | bc)
+        rel_y=$(echo "$center_offset_y + $grid_y * $min_dim / 100" | bc)
+    else
+        # Standard: map to full display dimensions
+        rel_x=$(echo "$grid_x * $DISPLAY_WIDTH / 100" | bc)
+        rel_y=$(echo "$grid_y * $DISPLAY_HEIGHT / 100" | bc)
+    fi
 
     local pixel_x=$(echo "$DISPLAY_X_OFFSET + $rel_x" | bc)
     local pixel_y=$(echo "$DISPLAY_Y_OFFSET + $rel_y" | bc)
@@ -356,10 +320,25 @@ MOUSE ACTIONS:
     --drag <coords>           Drag with smooth, visible movement (grid %)
                               Formats: x1,y1,x2,y2 (point to point)
                                        x1,y1,w,h,x2,y2 (box to point, auto-centers start)
-    --drag-text <text> <x>,<y>  Find text via OCR and drag to destination point
-    --drag-text-to-text <src> <tgt>  Find both texts and drag source onto target
+                              Tip: Use --region + --read-page to get element coordinates
     --drag-speed <slow|normal|fast>  Set drag speed (default: normal)
-                              slow=50ms/step, normal=25ms/step, fast=10ms/step
+                              slow=2.5s, normal=1.6s, fast=0.6s (uses ease-in-out)
+    --arc <pos:tension>       Add curve to drag path (use with --drag)
+                              pos: ±1 to ±179 (+ curves left, - curves right)
+                                   magnitude = arc angle (90 = quarter circle)
+                              tension=0: TRUE circular arc (mathematically perfect)
+                              tension≠0: Bézier approximation (-100=flat, +100=L-corner)
+                              Example: --drag 20,50,80,50 --arc 90:0  (perfect quarter circle)
+    --drag-easing <type>      Set drag easing (default: ease-in-out)
+                              linear (constant speed, best for precision drawing)
+                              ease-in (slow start), ease-out (slow end)
+                              ease-in-out (natural movement)
+    --drag-steps <n>          Set drag smoothness (default: 60, range: 10-500)
+                              More steps = smoother curves, slower execution
+    --aspect [region]         Enable square coordinate space (for shapes)
+                              Maps 0-100% to equal pixel distances in X and Y
+                              Optional region: x1,y1,x2,y2 (from --read-page bounds)
+                              Example: --aspect 3,16,64,98 (canvas bounds)
     --nudge <dx>,<dy>         Nudge cursor by pixel offset (e.g., 0,-5 = up 5px)
     --scroll <dir> [amt] [x,y]  Scroll at position (dir: up/down/left/right, amt: units)
     --scroll-in-app <app> <dir> [amt]  Scroll within app's window (auto-finds display)
@@ -380,6 +359,7 @@ OCR TEXT OPERATIONS:
                                        --json (structured JSON output)
                                        --save-screenshot <path>
                                        --no-images (skip image detection)
+                                       --region x1,y1,x2,y2 (filter to % region)
     --near <text>             Select match closest to anchor text (RECOMMENDED for disambiguation)
                               Use when multiple matches exist - finds the one nearest to anchor.
                               Example: --near "share save" --find-text "comments" finds "comments"
@@ -397,9 +377,6 @@ UI ELEMENT OPERATIONS (accessibility-based, works with native macOS apps):
     --click-info <label>      Click info (i) button near text label
     --list-elements [type]    List interactive UI elements (toggle, button, info, slider)
                               Requires --in-app to be set. Types: toggle, button, info, slider
-    --focus <x,y,w,h>         Focus on region and detect UI elements (icons, buttons)
-                              x,y = top-left corner (%), w,h = size (%)
-                              Returns numbered elements with bounding boxes for --click
 
     When to use OCR vs Accessibility:
       • --click-text: Any visible text (links, menu items, button labels)
@@ -412,32 +389,28 @@ ATOMIC COMMAND CHAINS:
                               Format: "action:argument" (e.g., "open:Firefox")
                               Actions: open, activate, wait, click, click-text, click-text-near,
                                        type, key, combo, scroll, page-top, page-bottom, in-app,
-                                       focus, switch-tab, goto, back, back-no-close, forward, up,
+                                       switch-tab, goto, back, back-no-close, forward, up,
                                        home, end, close-tab, select-next, select-prev, select-first,
                                        select-last, open-selection, select-all, play-pause,
                                        next-track, prev-track, volume-up, volume-down, mute,
                                        brightness-up, brightness-down, screenshot, clipboard-read,
                                        copy-text, copy-image, copy-file, wait-for-text,
                                        wait-for-change, verify-text
-                              Focus+Click: focus:x,y,w,h - detect elements in region
-                                           click:left - click leftmost element
-                                           click:left+1 - click second from left
-                                           click:right - click rightmost element
-                                           click:right-1 - click second from right
-                                           click:top/bottom - click topmost/bottommost
-                                           Example: "focus:45,94,15,6" "click:left"
                               OCR clicks: click-text:X - click on text X
                                           click-text-near:X|Y - click text X nearest to Y
                                           right-click-text:X - right-click on text X
                                           right-click-text-near:X|Y - right-click X near Y
                               Dragging: drag:x1,y1,x2,y2 - smooth drag between points
                                         drag:x1,y1,w,h,x2,y2 - drag from box center to point
-                                        drag-text:text,x,y - find text and drag to point
-                                        drag-text-to-text:src|tgt - drag source to target
-                                        drag-focus:pos,x,y - drag focus element to point
-                                        drag-focus:from,to - drag between focus elements
-                                        drag-focus-to-text:pos|text - drag focus to OCR text
-                                        drag-to-focus:x,y,pos - drag from point to focus element
+                                        arc:pos:tension - curve preceding drag (±1-179:±100)
+                                        dragend: - explicit mouse release (breaks auto-chain)
+                                        drag-easing:type - set easing (linear/ease-in/etc)
+                                        drag-steps:N - set smoothness (10-500)
+                                        aspect[:x1,y1,x2,y2] - square coords (opt region)
+                                        Auto-chaining: consecutive drags stay connected
+                                        Example circle: "drag:70,50,50,30" "arc:90:0" \
+                                                        "drag:50,30,30,50" "arc:90:0" ...
+                                        Use --region + --read-page to get element coordinates
                               Navigation: back - smart back (auto-closes if no history)
                                           back-no-close - simple back (no auto-close)
                                           forward, up - browser/Finder navigation
@@ -748,6 +721,33 @@ click_grid() {
             if [[ -n "$bounds" ]]; then
                 IFS=',' read -r win_x win_y win_w win_h <<< "$bounds"
 
+                # When ASPECT_CORRECT is set with IN_APP, use app window dimensions for square space
+                if [[ -n "$ASPECT_CORRECT" ]]; then
+                    local min_dim=$((win_w < win_h ? win_w : win_h))
+                    local offset_x=$(( (win_w - min_dim) / 2 ))
+                    local offset_y=$(( (win_h - min_dim) / 2 ))
+
+                    # Aspect coords → absolute pixel (centered square within app window)
+                    local abs_x=$(awk "BEGIN {print int($win_x + $offset_x + $grid_x * $min_dim / 100)}")
+                    local abs_y=$(awk "BEGIN {print int($win_y + $offset_y + $grid_y * $min_dim / 100)}")
+
+                    echo "Aspect click ($grid_x,$grid_y) in ${min_dim}x${min_dim} square → pixel ($abs_x,$abs_y)" >&2
+
+                    # Click directly at pixel - bypass grid_to_pixel
+                    local cli_x="$abs_x"
+                    local cli_y="$abs_y"
+                    [[ $abs_x -lt 0 ]] && cli_x="=$abs_x"
+                    [[ $abs_y -lt 0 ]] && cli_y="=$abs_y"
+
+                    if [[ "$click_type" == "dc" ]]; then
+                        cliclick "$click_type:$cli_x,$cli_y"
+                    else
+                        cliclick "m:$cli_x,$cli_y" "$click_type:."
+                    fi
+                    auto_read_page
+                    return 0
+                fi
+
                 # App-relative % → absolute pixel
                 local abs_x=$(awk "BEGIN {print int($win_x + $grid_x * $win_w / 100)}")
                 local abs_y=$(awk "BEGIN {print int($win_y + $grid_y * $win_h / 100)}")
@@ -844,6 +844,95 @@ move_mouse() {
     cliclick "m:$cli_x,$cli_y" "m:$cli_nudge_x,$cli_y" "m:$cli_x,$cli_y"
 }
 
+# Convert drag grid coordinates to absolute pixels
+# Returns: abs_x1,abs_y1,abs_x2,abs_y2 or empty on error
+# Uses IN_APP, REGION, ASPECT_CORRECT globals
+drag_coords_to_pixels() {
+    local coords="$1"
+
+    # Parse coordinates - support both formats
+    IFS=',' read -r v1 v2 v3 v4 v5 v6 <<< "$coords"
+
+    local x1 y1 x2 y2
+
+    if [[ -n "$v5" && -n "$v6" ]]; then
+        # 6 values: x,y,w,h,x2,y2 - box to point format
+        x1=$(awk "BEGIN {printf \"%.1f\", $v1 + $v3 / 2}")
+        y1=$(awk "BEGIN {printf \"%.1f\", $v2 + $v4 / 2}")
+        x2="$v5"
+        y2="$v6"
+    else
+        # 4 values: x1,y1,x2,y2
+        x1="$v1"
+        y1="$v2"
+        x2="$v3"
+        y2="$v4"
+    fi
+
+    [[ -z "$x1" || -z "$y1" || -z "$x2" || -z "$y2" ]] && return 1
+
+    local abs_x1 abs_y1 abs_x2 abs_y2
+
+    if [[ -n "$IN_APP" ]]; then
+        local where=$("$PYTHON" "$WINDOW_LIST" --app "$IN_APP" --where 2>&1)
+        if ! echo "$where" | grep -q "No window found"; then
+            local bounds=$(echo "$where" | grep "^BOUNDS:" | sed 's/BOUNDS: //')
+            if [[ -n "$bounds" ]]; then
+                IFS=',' read -r win_x win_y win_w win_h <<< "$bounds"
+
+                local draw_x draw_y draw_w draw_h
+                if [[ -n "$REGION" ]]; then
+                    IFS=',' read -r rx1 ry1 rx2 ry2 <<< "$REGION"
+                    draw_x=$(awk "BEGIN {print int($win_x + $rx1 * $win_w / 100)}")
+                    draw_y=$(awk "BEGIN {print int($win_y + $ry1 * $win_h / 100)}")
+                    draw_w=$(awk "BEGIN {print int(($rx2 - $rx1) * $win_w / 100)}")
+                    draw_h=$(awk "BEGIN {print int(($ry2 - $ry1) * $win_h / 100)}")
+                else
+                    draw_x=$win_x
+                    draw_y=$win_y
+                    draw_w=$win_w
+                    draw_h=$win_h
+                fi
+
+                if [[ -n "$ASPECT_CORRECT" ]]; then
+                    local min_dim=$((draw_w < draw_h ? draw_w : draw_h))
+                    local off_x=$(( (draw_w - min_dim) / 2 ))
+                    local off_y=$(( (draw_h - min_dim) / 2 ))
+                    abs_x1=$(awk "BEGIN {print int($draw_x + $off_x + $x1 * $min_dim / 100)}")
+                    abs_y1=$(awk "BEGIN {print int($draw_y + $off_y + $y1 * $min_dim / 100)}")
+                    abs_x2=$(awk "BEGIN {print int($draw_x + $off_x + $x2 * $min_dim / 100)}")
+                    abs_y2=$(awk "BEGIN {print int($draw_y + $off_y + $y2 * $min_dim / 100)}")
+                else
+                    abs_x1=$(awk "BEGIN {print int($draw_x + $x1 * $draw_w / 100)}")
+                    abs_y1=$(awk "BEGIN {print int($draw_y + $y1 * $draw_h / 100)}")
+                    abs_x2=$(awk "BEGIN {print int($draw_x + $x2 * $draw_w / 100)}")
+                    abs_y2=$(awk "BEGIN {print int($draw_y + $y2 * $draw_h / 100)}")
+                fi
+            fi
+        fi
+    fi
+
+    # Fallback to display-relative
+    if [[ -z "$abs_x1" ]]; then
+        if [[ -n "$ASPECT_CORRECT" ]]; then
+            local min_dim=$((DISPLAY_WIDTH < DISPLAY_HEIGHT ? DISPLAY_WIDTH : DISPLAY_HEIGHT))
+            local off_x=$(( (DISPLAY_WIDTH - min_dim) / 2 ))
+            local off_y=$(( (DISPLAY_HEIGHT - min_dim) / 2 ))
+            abs_x1=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $off_x + $x1 * $min_dim / 100)}")
+            abs_y1=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $off_y + $y1 * $min_dim / 100)}")
+            abs_x2=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $off_x + $x2 * $min_dim / 100)}")
+            abs_y2=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $off_y + $y2 * $min_dim / 100)}")
+        else
+            abs_x1=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $x1 * $DISPLAY_WIDTH / 100)}")
+            abs_y1=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $y1 * $DISPLAY_HEIGHT / 100)}")
+            abs_x2=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $x2 * $DISPLAY_WIDTH / 100)}")
+            abs_y2=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $y2 * $DISPLAY_HEIGHT / 100)}")
+        fi
+    fi
+
+    echo "$abs_x1,$abs_y1,$abs_x2,$abs_y2"
+}
+
 # Drag from point to point with smooth, visible movement
 # Uses intermediate points so web apps register the drag properly
 # Supports two formats:
@@ -851,6 +940,8 @@ move_mouse() {
 #   x1,y1,w1,h1,x2,y2 - box (auto-centered) to point
 drag_mouse() {
     local coords="$1"
+    local skip_down="${2:-}"  # If "1", skip mouse-down (already held from prev drag)
+    local skip_up="${3:-}"    # If "1", skip mouse-up (more drags coming)
 
     # Parse coordinates - support both formats
     IFS=',' read -r v1 v2 v3 v4 v5 v6 <<< "$coords"
@@ -881,7 +972,10 @@ drag_mouse() {
     # Restore target app if set
     restore_target_app
 
-    # Translate app-relative coords to display-relative when IN_APP is set
+    # Convert percentages to absolute pixel coordinates
+    # Priority: REGION (if set) > IN_APP > display
+    local abs_x1 abs_y1 abs_x2 abs_y2
+
     if [[ -n "$IN_APP" ]]; then
         local where=$("$PYTHON" "$WINDOW_LIST" --app "$IN_APP" --where 2>&1)
         if ! echo "$where" | grep -q "No window found"; then
@@ -889,227 +983,471 @@ drag_mouse() {
             if [[ -n "$bounds" ]]; then
                 IFS=',' read -r win_x win_y win_w win_h <<< "$bounds"
 
-                # Translate start point: App-relative % → display-relative %
-                local abs_x1=$(awk "BEGIN {print int($win_x + $x1 * $win_w / 100)}")
-                local abs_y1=$(awk "BEGIN {print int($win_y + $y1 * $win_h / 100)}")
-                x1=$(awk "BEGIN {printf \"%.1f\", ($abs_x1 - $DISPLAY_X_OFFSET) * 100 / $DISPLAY_WIDTH}")
-                y1=$(awk "BEGIN {printf \"%.1f\", ($abs_y1 - $DISPLAY_Y_OFFSET) * 100 / $DISPLAY_HEIGHT}")
+                # If REGION is set, calculate the region bounds within the window
+                local draw_x draw_y draw_w draw_h
+                if [[ -n "$REGION" ]]; then
+                    # REGION format: rx1,ry1,rx2,ry2 (percentages within window)
+                    IFS=',' read -r rx1 ry1 rx2 ry2 <<< "$REGION"
+                    draw_x=$(awk "BEGIN {print int($win_x + $rx1 * $win_w / 100)}")
+                    draw_y=$(awk "BEGIN {print int($win_y + $ry1 * $win_h / 100)}")
+                    draw_w=$(awk "BEGIN {print int(($rx2 - $rx1) * $win_w / 100)}")
+                    draw_h=$(awk "BEGIN {print int(($ry2 - $ry1) * $win_h / 100)}")
+                else
+                    draw_x=$win_x
+                    draw_y=$win_y
+                    draw_w=$win_w
+                    draw_h=$win_h
+                fi
 
-                # Translate end point: App-relative % → display-relative %
-                local abs_x2=$(awk "BEGIN {print int($win_x + $x2 * $win_w / 100)}")
-                local abs_y2=$(awk "BEGIN {print int($win_y + $y2 * $win_h / 100)}")
-                x2=$(awk "BEGIN {printf \"%.1f\", ($abs_x2 - $DISPLAY_X_OFFSET) * 100 / $DISPLAY_WIDTH}")
-                y2=$(awk "BEGIN {printf \"%.1f\", ($abs_y2 - $DISPLAY_Y_OFFSET) * 100 / $DISPLAY_HEIGHT}")
+                if [[ -n "$ASPECT_CORRECT" ]]; then
+                    # Square coordinate space within region/window
+                    local min_dim=$((draw_w < draw_h ? draw_w : draw_h))
+                    local off_x=$(( (draw_w - min_dim) / 2 ))
+                    local off_y=$(( (draw_h - min_dim) / 2 ))
+                    abs_x1=$(awk "BEGIN {print int($draw_x + $off_x + $x1 * $min_dim / 100)}")
+                    abs_y1=$(awk "BEGIN {print int($draw_y + $off_y + $y1 * $min_dim / 100)}")
+                    abs_x2=$(awk "BEGIN {print int($draw_x + $off_x + $x2 * $min_dim / 100)}")
+                    abs_y2=$(awk "BEGIN {print int($draw_y + $off_y + $y2 * $min_dim / 100)}")
+                else
+                    abs_x1=$(awk "BEGIN {print int($draw_x + $x1 * $draw_w / 100)}")
+                    abs_y1=$(awk "BEGIN {print int($draw_y + $y1 * $draw_h / 100)}")
+                    abs_x2=$(awk "BEGIN {print int($draw_x + $x2 * $draw_w / 100)}")
+                    abs_y2=$(awk "BEGIN {print int($draw_y + $y2 * $draw_h / 100)}")
+                fi
             fi
         fi
     fi
 
-    local start=$(grid_to_pixel "$x1" "$y1")
-    local end=$(grid_to_pixel "$x2" "$y2")
+    # Fallback to display-relative if no app context
+    if [[ -z "$abs_x1" ]]; then
+        if [[ -n "$ASPECT_CORRECT" ]]; then
+            # Square coordinate space within display
+            local min_dim=$((DISPLAY_WIDTH < DISPLAY_HEIGHT ? DISPLAY_WIDTH : DISPLAY_HEIGHT))
+            local off_x=$(( (DISPLAY_WIDTH - min_dim) / 2 ))
+            local off_y=$(( (DISPLAY_HEIGHT - min_dim) / 2 ))
+            abs_x1=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $off_x + $x1 * $min_dim / 100)}")
+            abs_y1=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $off_y + $y1 * $min_dim / 100)}")
+            abs_x2=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $off_x + $x2 * $min_dim / 100)}")
+            abs_y2=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $off_y + $y2 * $min_dim / 100)}")
+        else
+            abs_x1=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $x1 * $DISPLAY_WIDTH / 100)}")
+            abs_y1=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $y1 * $DISPLAY_HEIGHT / 100)}")
+            abs_x2=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $x2 * $DISPLAY_WIDTH / 100)}")
+            abs_y2=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $y2 * $DISPLAY_HEIGHT / 100)}")
+        fi
+    fi
 
-    local sx=$(echo "$start" | awk '{print $1}')
-    local sy=$(echo "$start" | awk '{print $2}')
-    local ex=$(echo "$end" | awk '{print $1}')
-    local ey=$(echo "$end" | awk '{print $2}')
+    # Check if arc parameters are set
+    if [[ -n "$ARC_POSITION" ]]; then
+        echo "Arc dragging from ($x1%, $y1%) to ($x2%, $y2%) [pos=$ARC_POSITION, tension=$ARC_TENSION]" >&2
+    else
+        echo "Dragging from ($x1%, $y1%) to ($x2%, $y2%)" >&2
+    fi
+    echo "Pixels: ($abs_x1, $abs_y1) → ($abs_x2, $abs_y2)" >&2
 
-    echo "Dragging from ($x1%, $y1%) to ($x2%, $y2%)"
+    # Use Python/Quartz for smooth drag
+    local duration=${DRAG_DURATION:-1.6}
+    local easing=${DRAG_EASING:-ease-in-out}
+    local steps=${DRAG_STEPS:-60}
+    local arc_pos="${ARC_POSITION:-0}"
+    local arc_tension="${ARC_TENSION:-0}"
+    local skip_down_flag="${skip_down:-0}"
+    local skip_up_flag="${skip_up:-0}"
+    "$PYTHON" - "$abs_x1" "$abs_y1" "$abs_x2" "$abs_y2" "$duration" "$arc_pos" "$arc_tension" "$skip_down_flag" "$skip_up_flag" "$easing" "$steps" <<'PYEOF'
+import sys
+import time
+import math
+from Quartz import (
+    CGEventCreateMouseEvent,
+    CGEventPost,
+    kCGEventLeftMouseDown,
+    kCGEventLeftMouseUp,
+    kCGEventLeftMouseDragged,
+    kCGHIDEventTap,
+    CGEventSetIntegerValueField,
+    kCGMouseEventClickState
+)
 
-    # Build command with intermediate points for smooth, visible drag
-    local steps=${DRAG_STEPS:-20}
-    local step_ms=${DRAG_STEP_MS:-25}
-    local easing=${DRAG_EASING:-3}
+def ease_linear(t):
+    """Linear interpolation - constant speed, best for precision drawing."""
+    return t
 
-    # Calculate deltas
-    local dx=$((ex - sx))
-    local dy=$((ey - sy))
+def ease_in(t):
+    """Cubic ease-in - slow start, fast end."""
+    return t * t * t
 
-    # Build cliclick command array
-    local cmd_args=()
-    cmd_args+=("-e" "$easing")
-    cmd_args+=("-w" "$step_ms")
+def ease_out(t):
+    """Cubic ease-out - fast start, slow end."""
+    return 1 - pow(1 - t, 3)
 
-    # Move to start position first
-    cmd_args+=("m:$sx,$sy")
+def ease_in_out(t):
+    """Cubic ease-in-out - slow start and end, fast middle."""
+    if t < 0.5:
+        return 4 * t * t * t
+    else:
+        return 1 - pow(-2 * t + 2, 3) / 2
 
-    # Mouse down at start
-    cmd_args+=("dd:$sx,$sy")
-
-    # Generate intermediate points (using integer math)
-    for ((i=1; i<=steps; i++)); do
-        # Calculate position at step i (linear interpolation)
-        local px=$((sx + (dx * i / steps)))
-        local py=$((sy + (dy * i / steps)))
-        cmd_args+=("dm:$px,$py")
-    done
-
-    # Mouse up at end
-    cmd_args+=("du:$ex,$ey")
-
-    # Execute the smooth drag
-    cliclick "${cmd_args[@]}"
+EASING_FUNCS = {
+    'linear': ease_linear,
+    'ease-in': ease_in,
+    'ease-out': ease_out,
+    'ease-in-out': ease_in_out,
 }
 
-# Drag from OCR text to a point
-# Usage: drag_text "Search Text" x,y (destination)
-drag_text() {
-    local search_text="$1"
-    local dest="$2"
-    local instance="${INSTANCE:-1}"
-    local in_app="${IN_APP:-}"
+def smooth_drag(x1, y1, x2, y2, duration=1.6, steps=60, arc_position=0, arc_tension=0,
+                skip_mouse_down=False, skip_mouse_up=False, easing='ease-in-out'):
+    """
+    Perform smooth drag using Quartz events.
 
-    echo "Finding text to drag: '$search_text'..."
+    arc_position: ±1 to ±179
+        Sign = direction (+ curves left, - curves right)
+        Magnitude = apex location (1=start, 90=center, 179=end)
+    arc_tension: shape control
+        negative = straighter, 0 = circular arc, positive = L-cornered
+    skip_mouse_down: If True, assume mouse is already held (for chained drags)
+    skip_mouse_up: If True, don't release mouse (for chained drags)
+    easing: 'linear', 'ease-in', 'ease-out', 'ease-in-out'
+           For chained drags: easing only applies at chain boundaries
+           - First drag (skip_down=False): applies ease-in
+           - Last drag (skip_up=False): applies ease-out
+           - Middle drags: always linear for smooth continuous motion
+    """
+    # Determine effective easing based on chain position
+    if easing == 'linear':
+        ease_func = ease_linear
+    elif skip_mouse_down and skip_mouse_up:
+        # Middle of chain: always linear for smooth motion
+        ease_func = ease_linear
+    elif skip_mouse_down and not skip_mouse_up:
+        # Last segment: ease-out only
+        ease_func = ease_out if easing in ('ease-out', 'ease-in-out') else ease_linear
+    elif not skip_mouse_down and skip_mouse_up:
+        # First segment: ease-in only
+        ease_func = ease_in if easing in ('ease-in', 'ease-in-out') else ease_linear
+    else:
+        # Single drag (no chaining): use full easing
+        ease_func = EASING_FUNCS.get(easing, ease_in_out)
 
-    # Find text using OCR
-    local coords_file="/tmp/drag_text_coords_$$.txt"
-    local find_timeout="${OCR_TIMEOUT:-10}"
+    if not skip_mouse_down:
+        # Move to start position
+        move_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, (x1, y1), 0)
+        CGEventPost(kCGHIDEventTap, move_event)
+        time.sleep(0.05)
 
-    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$search_text" "$instance" "$DISPLAY_NUM" "$in_app" "$NEAR_TEXT" > "$coords_file" ) &
-    local find_pid=$!
+        # Mouse down
+        down_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x1, y1), 0)
+        CGEventSetIntegerValueField(down_event, kCGMouseEventClickState, 1)
+        CGEventPost(kCGHIDEventTap, down_event)
+        time.sleep(0.05)
 
-    # Wait with timeout
-    local waited=0
-    while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
-        sleep 0.2
-        waited=$((waited + 1))
-    done
+    # Calculate arc parameters
+    use_true_circle = (arc_position != 0 and arc_tension == 0)
+    ctrl_x, ctrl_y = None, None
+    center_x, center_y, radius, start_angle, end_angle = None, None, None, None, None
 
-    if kill -0 $find_pid 2>/dev/null; then
-        pkill -P $find_pid 2>/dev/null
-        kill $find_pid 2>/dev/null
-        wait $find_pid 2>/dev/null
-        rm -f "$coords_file"
-        echo "ERROR: Text search timed out"
-        return 1
-    fi
+    if arc_position != 0:
+        # Chord vector
+        dx, dy = x2 - x1, y2 - y1
+        chord_len = math.sqrt(dx*dx + dy*dy)
 
-    wait $find_pid
-    local coords=$(cat "$coords_file" 2>/dev/null)
-    rm -f "$coords_file"
+        if chord_len > 0:
+            # Direction from sign of position
+            perp_sign = 1 if arc_position > 0 else -1
 
-    if [[ -z "$coords" || "$coords" == *"NOT_FOUND"* || "$coords" == *"ERROR"* ]]; then
-        echo "ERROR: Text not found: '$search_text'"
-        return 1
-    fi
+            if use_true_circle:
+                # TRUE CIRCULAR ARC when tension=0
+                # position magnitude = arc angle in degrees (90 = quarter circle)
+                arc_angle_deg = abs(arc_position)
+                arc_angle = math.radians(arc_angle_deg)
 
-    echo "Found '$search_text' at: $coords"
+                # Radius from chord and arc angle: chord = 2 * r * sin(θ/2)
+                half_angle = arc_angle / 2
+                radius = chord_len / (2 * math.sin(half_angle))
 
-    # Parse source coords (may be x,y or x,y,w,h)
-    IFS=',' read -r sx sy sw sh <<< "$coords"
+                # Center is perpendicular from midpoint of chord
+                # Distance from midpoint to center = r * cos(θ/2)
+                mid_x = (x1 + x2) / 2
+                mid_y = (y1 + y2) / 2
 
-    # Parse destination (x,y)
-    IFS=',' read -r dx dy <<< "$dest"
+                # Perpendicular unit vector (screen coords: Y increases downward)
+                perp_x = dy / chord_len * perp_sign
+                perp_y = -dx / chord_len * perp_sign
 
-    if [[ -z "$dx" || -z "$dy" ]]; then
-        echo "ERROR: Invalid destination. Use format: x,y"
-        return 1
-    fi
+                center_dist = radius * math.cos(half_angle)
+                center_x = mid_x + perp_x * center_dist
+                center_y = mid_y + perp_y * center_dist
 
-    # Build drag coords - if we have a box, use box format; otherwise point format
-    if [[ -n "$sw" && -n "$sh" ]]; then
-        drag_mouse "$sx,$sy,$sw,$sh,$dx,$dy"
-    else
-        drag_mouse "$sx,$sy,$dx,$dy"
-    fi
+                # Calculate start and end angles from center
+                start_angle = math.atan2(y1 - center_y, x1 - center_x)
+                end_angle = math.atan2(y2 - center_y, x2 - center_x)
+
+                # Ensure we go the right direction around the circle
+                # For positive position (left curve), we want counterclockwise
+                # For negative position (right curve), we want clockwise
+                angle_diff = end_angle - start_angle
+
+                # Normalize angle difference to determine direction
+                if perp_sign > 0:  # Left curve = counterclockwise
+                    if angle_diff < 0:
+                        angle_diff += 2 * math.pi
+                    if angle_diff > math.pi:
+                        angle_diff -= 2 * math.pi
+                else:  # Right curve = clockwise
+                    if angle_diff > 0:
+                        angle_diff -= 2 * math.pi
+                    if angle_diff < -math.pi:
+                        angle_diff += 2 * math.pi
+
+                end_angle = start_angle + angle_diff
+
+            else:
+                # BÉZIER APPROXIMATION when tension != 0
+                # Apex position along chord (1-179 → 0.0-1.0)
+                t_pos = abs(arc_position) / 180.0
+
+                # Perpendicular unit vector (screen coords: Y increases downward)
+                perp_x = dy / chord_len * perp_sign
+                perp_y = -dx / chord_len * perp_sign
+
+                # Control point base position along chord
+                ctrl_base_x = x1 + dx * t_pos
+                ctrl_base_y = y1 + dy * t_pos
+
+                # Control point offset (perpendicular distance)
+                if arc_tension > 0:
+                    # positive: L-corner (sharper)
+                    offset = chord_len * (0.5 + 0.5 * arc_tension / 100.0)
+                else:
+                    # negative: flatten toward straight line
+                    offset = chord_len * 0.5 * max(0, 1 + arc_tension / 100.0)
+
+                ctrl_x = ctrl_base_x + perp_x * offset
+                ctrl_y = ctrl_base_y + perp_y * offset
+
+    # Smooth drag
+    step_delay = duration / steps
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased_t = ease_func(t)
+
+        if use_true_circle and center_x is not None:
+            # TRUE CIRCULAR ARC: interpolate angle, trace circle
+            angle = start_angle + (end_angle - start_angle) * eased_t
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+        elif ctrl_x is not None:
+            # Quadratic Bézier: B(t) = (1-t)²P1 + 2(1-t)t·Ctrl + t²P2
+            inv_t = 1 - eased_t
+            x = inv_t*inv_t*x1 + 2*inv_t*eased_t*ctrl_x + eased_t*eased_t*x2
+            y = inv_t*inv_t*y1 + 2*inv_t*eased_t*ctrl_y + eased_t*eased_t*y2
+        else:
+            # Linear interpolation
+            x = x1 + (x2 - x1) * eased_t
+            y = y1 + (y2 - y1) * eased_t
+
+        drag_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, (x, y), 0)
+        CGEventPost(kCGHIDEventTap, drag_event)
+        time.sleep(step_delay)
+
+    if not skip_mouse_up:
+        # Mouse up
+        up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x2, y2), 0)
+        CGEventPost(kCGHIDEventTap, up_event)
+
+if __name__ == '__main__':
+    x1, y1 = float(sys.argv[1]), float(sys.argv[2])
+    x2, y2 = float(sys.argv[3]), float(sys.argv[4])
+    duration = float(sys.argv[5]) if len(sys.argv) > 5 else 1.6
+    arc_position = int(sys.argv[6]) if len(sys.argv) > 6 else 0
+    arc_tension = int(sys.argv[7]) if len(sys.argv) > 7 else 0
+    skip_mouse_down = sys.argv[8] == "1" if len(sys.argv) > 8 else False
+    skip_mouse_up = sys.argv[9] == "1" if len(sys.argv) > 9 else False
+    easing = sys.argv[10] if len(sys.argv) > 10 else 'ease-in-out'
+    steps = int(sys.argv[11]) if len(sys.argv) > 11 else 60
+    smooth_drag(x1, y1, x2, y2, duration, steps, arc_position, arc_tension,
+                skip_mouse_down, skip_mouse_up, easing)
+PYEOF
+
+    auto_read_page
 }
 
-# Drag from one OCR text to another OCR text
-# Usage: drag_text_to_text "Source Text" "Target Text"
-drag_text_to_text() {
-    local source_text="$1"
-    local target_text="$2"
-    local source_instance="${SOURCE_INSTANCE:-1}"
-    local target_instance="${TARGET_INSTANCE:-1}"
-    local in_app="${IN_APP:-}"
+# Batch drag - execute multiple drag segments in a single Python process
+# Usage: drag_batch "x1,y1,x2,y2,arc_pos,arc_tension" "x1,y1,x2,y2,arc_pos,arc_tension" ...
+# All coordinates should already be in absolute pixels
+drag_batch() {
+    local duration=${DRAG_DURATION:-1.6}
+    local easing=${DRAG_EASING:-ease-in-out}
+    local steps=${DRAG_STEPS:-60}
 
-    echo "Dragging '$source_text' to '$target_text'..."
-
-    # Find source text
-    local coords_file="/tmp/drag_text_src_$$.txt"
-    local find_timeout="${OCR_TIMEOUT:-10}"
-
-    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$source_text" "$source_instance" "$DISPLAY_NUM" "$in_app" "$NEAR_TEXT" > "$coords_file" ) &
-    local find_pid=$!
-
-    local waited=0
-    while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
-        sleep 0.2
-        waited=$((waited + 1))
+    # Build segments array as JSON-like format for Python
+    local segments=""
+    for seg in "$@"; do
+        [[ -n "$segments" ]] && segments="$segments;"
+        segments="$segments$seg"
     done
 
-    if kill -0 $find_pid 2>/dev/null; then
-        pkill -P $find_pid 2>/dev/null
-        kill $find_pid 2>/dev/null
-        wait $find_pid 2>/dev/null
-        rm -f "$coords_file"
-        echo "ERROR: Source text search timed out"
-        return 1
-    fi
+    "$PYTHON" - "$segments" "$duration" "$easing" "$steps" <<'PYEOF'
+import sys
+import time
+import math
+from Quartz import (
+    CGEventCreateMouseEvent,
+    CGEventPost,
+    kCGEventLeftMouseDown,
+    kCGEventLeftMouseUp,
+    kCGEventLeftMouseDragged,
+    kCGHIDEventTap,
+    CGEventSetIntegerValueField,
+    kCGMouseEventClickState
+)
 
-    wait $find_pid
-    local source_coords=$(cat "$coords_file" 2>/dev/null)
-    rm -f "$coords_file"
+def ease_linear(t):
+    return t
 
-    if [[ -z "$source_coords" || "$source_coords" == *"NOT_FOUND"* || "$source_coords" == *"ERROR"* ]]; then
-        echo "ERROR: Source text not found: '$source_text'"
-        return 1
-    fi
+def ease_in(t):
+    return t * t * t
 
-    echo "Found source '$source_text' at: $source_coords"
+def ease_out(t):
+    return 1 - pow(1 - t, 3)
 
-    # Find target text
-    coords_file="/tmp/drag_text_tgt_$$.txt"
+def ease_in_out(t):
+    if t < 0.5:
+        return 4 * t * t * t
+    else:
+        return 1 - pow(-2 * t + 2, 3) / 2
 
-    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$target_text" "$target_instance" "$DISPLAY_NUM" "$in_app" "" > "$coords_file" ) &
-    find_pid=$!
+def drag_segment(x1, y1, x2, y2, arc_position, arc_tension, duration, steps, ease_func):
+    """Execute a single drag segment (mouse already down, don't release)."""
+    use_true_circle = (arc_position != 0 and arc_tension == 0)
+    ctrl_x, ctrl_y = None, None
+    center_x, center_y, radius, start_angle, end_angle = None, None, None, None, None
 
-    waited=0
-    while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
-        sleep 0.2
-        waited=$((waited + 1))
-    done
+    if arc_position != 0:
+        dx, dy = x2 - x1, y2 - y1
+        chord_len = math.sqrt(dx*dx + dy*dy)
 
-    if kill -0 $find_pid 2>/dev/null; then
-        pkill -P $find_pid 2>/dev/null
-        kill $find_pid 2>/dev/null
-        wait $find_pid 2>/dev/null
-        rm -f "$coords_file"
-        echo "ERROR: Target text search timed out"
-        return 1
-    fi
+        if chord_len > 0:
+            perp_sign = 1 if arc_position > 0 else -1
 
-    wait $find_pid
-    local target_coords=$(cat "$coords_file" 2>/dev/null)
-    rm -f "$coords_file"
+            if use_true_circle:
+                arc_angle_deg = abs(arc_position)
+                arc_angle = math.radians(arc_angle_deg)
+                half_angle = arc_angle / 2
+                radius = chord_len / (2 * math.sin(half_angle))
+                mid_x = (x1 + x2) / 2
+                mid_y = (y1 + y2) / 2
+                perp_x = dy / chord_len * perp_sign
+                perp_y = -dx / chord_len * perp_sign
+                center_dist = radius * math.cos(half_angle)
+                center_x = mid_x + perp_x * center_dist
+                center_y = mid_y + perp_y * center_dist
+                start_angle = math.atan2(y1 - center_y, x1 - center_x)
+                end_angle = math.atan2(y2 - center_y, x2 - center_x)
+                angle_diff = end_angle - start_angle
+                if perp_sign > 0:
+                    if angle_diff < 0:
+                        angle_diff += 2 * math.pi
+                    if angle_diff > math.pi:
+                        angle_diff -= 2 * math.pi
+                else:
+                    if angle_diff > 0:
+                        angle_diff -= 2 * math.pi
+                    if angle_diff < -math.pi:
+                        angle_diff += 2 * math.pi
+                end_angle = start_angle + angle_diff
+            else:
+                t_pos = abs(arc_position) / 180.0
+                perp_x = dy / chord_len * perp_sign
+                perp_y = -dx / chord_len * perp_sign
+                ctrl_base_x = x1 + dx * t_pos
+                ctrl_base_y = y1 + dy * t_pos
+                if arc_tension > 0:
+                    offset = chord_len * (0.5 + 0.5 * arc_tension / 100.0)
+                else:
+                    offset = chord_len * 0.5 * max(0, 1 + arc_tension / 100.0)
+                ctrl_x = ctrl_base_x + perp_x * offset
+                ctrl_y = ctrl_base_y + perp_y * offset
 
-    if [[ -z "$target_coords" || "$target_coords" == *"NOT_FOUND"* || "$target_coords" == *"ERROR"* ]]; then
-        echo "ERROR: Target text not found: '$target_text'"
-        return 1
-    fi
+    step_delay = duration / steps
+    for i in range(1, steps + 1):
+        t = i / steps
+        eased_t = ease_func(t)
 
-    echo "Found target '$target_text' at: $target_coords"
+        if use_true_circle and center_x is not None:
+            angle = start_angle + (end_angle - start_angle) * eased_t
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+        elif ctrl_x is not None:
+            inv_t = 1 - eased_t
+            x = inv_t*inv_t*x1 + 2*inv_t*eased_t*ctrl_x + eased_t*eased_t*x2
+            y = inv_t*inv_t*y1 + 2*inv_t*eased_t*ctrl_y + eased_t*eased_t*y2
+        else:
+            x = x1 + (x2 - x1) * eased_t
+            y = y1 + (y2 - y1) * eased_t
 
-    # Parse source coords (x,y,w,h)
-    IFS=',' read -r sx sy sw sh <<< "$source_coords"
+        drag_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, (x, y), 0)
+        CGEventPost(kCGHIDEventTap, drag_event)
+        time.sleep(step_delay)
 
-    # Parse target coords to get center point
-    IFS=',' read -r tx ty tw th <<< "$target_coords"
+    return x2, y2
 
-    # Calculate target center
-    local dest_x dest_y
-    if [[ -n "$tw" && -n "$th" ]]; then
-        dest_x=$(awk "BEGIN {printf \"%.1f\", $tx + $tw / 2}")
-        dest_y=$(awk "BEGIN {printf \"%.1f\", $ty + $th / 2}")
-    else
-        dest_x="$tx"
-        dest_y="$ty"
-    fi
+if __name__ == '__main__':
+    segments_str = sys.argv[1]
+    duration = float(sys.argv[2]) if len(sys.argv) > 2 else 1.6
+    easing = sys.argv[3] if len(sys.argv) > 3 else 'ease-in-out'
+    steps = int(sys.argv[4]) if len(sys.argv) > 4 else 60
 
-    # Build drag coords
-    if [[ -n "$sw" && -n "$sh" ]]; then
-        drag_mouse "$sx,$sy,$sw,$sh,$dest_x,$dest_y"
-    else
-        drag_mouse "$sx,$sy,$dest_x,$dest_y"
-    fi
+    # Parse segments: "x1,y1,x2,y2,arc_pos,arc_tension;..."
+    segments = []
+    for seg_str in segments_str.split(';'):
+        parts = seg_str.split(',')
+        if len(parts) >= 4:
+            x1, y1, x2, y2 = float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
+            arc_pos = int(parts[4]) if len(parts) > 4 else 0
+            arc_ten = int(parts[5]) if len(parts) > 5 else 0
+            segments.append((x1, y1, x2, y2, arc_pos, arc_ten))
+
+    if not segments:
+        sys.exit(1)
+
+    num_segs = len(segments)
+
+    # Mouse down at first segment start
+    x1, y1 = segments[0][0], segments[0][1]
+    move_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, (x1, y1), 0)
+    CGEventPost(kCGHIDEventTap, move_event)
+    time.sleep(0.02)
+    down_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, (x1, y1), 0)
+    CGEventSetIntegerValueField(down_event, kCGMouseEventClickState, 1)
+    CGEventPost(kCGHIDEventTap, down_event)
+    time.sleep(0.02)
+
+    # Execute each segment
+    for idx, (x1, y1, x2, y2, arc_pos, arc_ten) in enumerate(segments):
+        # Determine easing for this segment
+        is_first = (idx == 0)
+        is_last = (idx == num_segs - 1)
+
+        if easing == 'linear':
+            ease_func = ease_linear
+        elif is_first and is_last:
+            # Single segment: full easing
+            ease_func = {'ease-in': ease_in, 'ease-out': ease_out, 'ease-in-out': ease_in_out}.get(easing, ease_in_out)
+        elif is_first:
+            ease_func = ease_in if easing in ('ease-in', 'ease-in-out') else ease_linear
+        elif is_last:
+            ease_func = ease_out if easing in ('ease-out', 'ease-in-out') else ease_linear
+        else:
+            ease_func = ease_linear
+
+        # Each segment gets full duration (not divided)
+        drag_segment(x1, y1, x2, y2, arc_pos, arc_ten, duration, steps, ease_func)
+
+    # Mouse up at last segment end
+    x2, y2 = segments[-1][2], segments[-1][3]
+    up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, (x2, y2), 0)
+    CGEventPost(kCGHIDEventTap, up_event)
+PYEOF
 }
 
 # Type text using Python/Quartz with inter-character delays
@@ -2225,7 +2563,9 @@ find_text_on_screen() {
     local find_args=("$search_text")
     [[ -n "$in_app" ]] && find_args+=(--in-app "$in_app")
     [[ -n "$near_text" ]] && find_args+=(--near "$near_text")
-    [[ -n "$instance" && -z "$near_text" ]] && find_args+=(--instance "$instance")
+    # Only pass --instance if user explicitly requested it (INSTANCE_EXPLICIT=1)
+    # Otherwise let find_text.py detect multiple matches and warn
+    [[ "$INSTANCE_EXPLICIT" == "1" && -n "$instance" && -z "$near_text" ]] && find_args+=(--instance "$instance")
     [[ -n "$display" ]] && find_args+=(--display "$display")
 
     # Run find_text.py with timeout
@@ -2266,9 +2606,9 @@ click_text() {
 
     # Run in background with timeout
     # Only capture stdout (coords), let stderr go to parent for logging
-    # Set INSTANCE_EXPLICIT so that multiple matches auto-select instance 1 in chains
     # Pass NEAR_TEXT as 5th arg for proximity-based search
-    ( INSTANCE_EXPLICIT=1 find_text_on_screen "$search_text" "$instance" "$DISPLAY_NUM" "$in_app" "$NEAR_TEXT" > "$coords_file" ) &
+    # INSTANCE_EXPLICIT is only set when user explicitly provides --instance (see pre-scan in main)
+    ( find_text_on_screen "$search_text" "$instance" "$DISPLAY_NUM" "$in_app" "$NEAR_TEXT" > "$coords_file" ) &
     local find_pid=$!
 
     # Wait with timeout (use 0.2s granularity for more responsive timeout)
@@ -2294,9 +2634,16 @@ click_text() {
     local coords=$(cat "$coords_file" 2>/dev/null)
     rm -f "$coords_file"
 
-    if [[ $find_status -ne 0 || -z "$coords" || "$coords" == *"NOT_FOUND"* || "$coords" == *"ERROR"* ]]; then
-        echo "ERROR: Text not found: '$search_text'"
-        [[ -n "$coords" ]] && echo "$coords"
+    if [[ $find_status -ne 0 || -z "$coords" || "$coords" == *"NOT_FOUND"* || "$coords" == *"ERROR"* || "$coords" == *"MULTIPLE_MATCHES"* ]]; then
+        # Show appropriate error based on response type
+        if [[ "$coords" == *"MULTIPLE_MATCHES"* ]]; then
+            echo "$coords"
+        elif [[ "$coords" == *"NOT_FOUND"* ]]; then
+            echo "$coords"
+        else
+            echo "ERROR: Text not found: '$search_text'"
+            [[ -n "$coords" ]] && echo "$coords"
+        fi
         return 1
     fi
 
@@ -2395,155 +2742,15 @@ list_elements() {
     fi
 }
 
-# Focus on a region and detect UI elements (icons, buttons)
-# Usage: focus_region <x,y,w,h> - percentages defining region to analyze
-# Returns numbered elements with bounding boxes in app-relative coordinates
-focus_region() {
-    local region="$1"
-    local app="${IN_APP:-}"
-
-    if [[ -z "$app" ]]; then
-        echo "ERROR: --in-app must be set to use --focus" >&2
-        return 1
-    fi
-
-    # Parse region: x,y,w,h (all percentages)
-    IFS=',' read -r reg_x reg_y reg_w reg_h <<< "$region"
-
-    if [[ -z "$reg_x" || -z "$reg_y" || -z "$reg_w" || -z "$reg_h" ]]; then
-        echo "ERROR: --focus requires region as x,y,w,h (percentages)" >&2
-        echo "Example: --focus 40,90,30,10 (30% wide, 10% tall region centered at 40%,90%)" >&2
-        return 1
-    fi
-
-    # Take screenshot of app
-    local screenshot
-    screenshot=$("$SCRIPT_DIR/screenshot.sh" --in-app "$app" --full-res 2>/dev/null | grep "^/tmp/" | head -1)
-    if [[ ! -f "$screenshot" ]]; then
-        echo "ERROR: Failed to capture screenshot" >&2
-        return 1
-    fi
-
-    # Get image dimensions and crop region
-    local cropped="/tmp/focus_region_$(date +%Y%m%d_%H%M%S).jpg"
-
-    # Use Python to crop and run element detection
-    "$PYTHON" - "$screenshot" "$reg_x" "$reg_y" "$reg_w" "$reg_h" "$cropped" <<'PYEOF'
-import sys
-from PIL import Image
-
-screenshot_path = sys.argv[1]
-reg_x = float(sys.argv[2])
-reg_y = float(sys.argv[3])
-reg_w = float(sys.argv[4])
-reg_h = float(sys.argv[5])
-cropped_path = sys.argv[6]
-
-img = Image.open(screenshot_path)
-width, height = img.size
-
-# Convert percentages to pixels
-x1 = int(reg_x * width / 100)
-y1 = int(reg_y * height / 100)
-x2 = int((reg_x + reg_w) * width / 100)
-y2 = int((reg_y + reg_h) * height / 100)
-
-# Crop and save (convert to RGB for JPEG compatibility)
-cropped = img.crop((x1, y1, x2, y2))
-if cropped.mode == 'RGBA':
-    cropped = cropped.convert('RGB')
-cropped.save(cropped_path, quality=95)
-print(cropped_path)
-PYEOF
-
-    if [[ ! -f "$cropped" ]]; then
-        echo "ERROR: Failed to crop region" >&2
-        return 1
-    fi
-
-    # Run element detection on cropped region
-    local elements
-    elements=$("$PYTHON" "$LIB_DIR/element_detect.py" --image "$cropped" --json 2>/dev/null)
-
-    if [[ -z "$elements" || "$elements" == "[]" ]]; then
-        echo "@focus $app region:$region"
-        echo "No elements detected in region"
-        echo "---"
-        return 0
-    fi
-
-    # Output header
-    echo "@focus $app region:$region"
-    echo "Image: $cropped"
-
-    # Transform element coordinates from region-relative to app-relative
-    # Output both human-readable format AND JSON for FOCUS_ELEMENTS
-    local transformed
-    transformed=$("$PYTHON" - "$elements" "$reg_x" "$reg_y" "$reg_w" "$reg_h" <<'PYEOF'
-import sys
-import json
-
-elements = json.loads(sys.argv[1])
-reg_x = float(sys.argv[2])
-reg_y = float(sys.argv[3])
-reg_w = float(sys.argv[4])
-reg_h = float(sys.argv[5])
-
-output_lines = []
-json_elements = []
-
-for elem in elements:
-    # Element bbox is relative to cropped region (0-100%)
-    # Convert to app-relative coordinates
-    ex, ey, ew, eh = elem['bbox']
-
-    # Scale and offset to app coordinates
-    app_x = reg_x + (ex * reg_w / 100)
-    app_y = reg_y + (ey * reg_h / 100)
-    app_w = ew * reg_w / 100
-    app_h = eh * reg_h / 100
-
-    # Human-readable format: [id] x,y,w,h type
-    output_lines.append(f"[{elem['id']}] {app_x:.1f},{app_y:.1f},{app_w:.1f},{app_h:.1f} {elem['type']}")
-
-    # JSON format for FOCUS_ELEMENTS
-    json_elements.append({
-        'id': elem['id'],
-        'x': round(app_x, 1),
-        'y': round(app_y, 1),
-        'w': round(app_w, 1),
-        'h': round(app_h, 1),
-        'type': elem['type']
-    })
-
-# Output human-readable lines
-for line in output_lines:
-    print(line)
-
-# Output JSON on special marker line for parsing
-print(f"__FOCUS_JSON__:{json.dumps(json_elements)}")
-PYEOF
-)
-
-    # Parse output: print human-readable lines, extract JSON for FOCUS_ELEMENTS
-    while IFS= read -r line; do
-        if [[ "$line" == __FOCUS_JSON__:* ]]; then
-            FOCUS_ELEMENTS="${line#__FOCUS_JSON__:}"
-        else
-            echo "$line"
-        fi
-    done <<< "$transformed"
-
-    echo "---"
-}
-
 # Read page - extract all visible text in LLM-friendly format
-# Usage: read_page <app> [--classify] [--json] [--save-screenshot <path>]
+# Usage: read_page <app> [--classify] [--json] [--save-screenshot <path>] [--region x1,y1,x2,y2]
 read_page() {
     local app="$1"
     local classify="$2"
     local json_output="$3"
     local save_screenshot="$4"
+    local region="$5"
+    local aspect="$6"
 
     if [[ -z "$app" ]]; then
         echo "ERROR: read_page requires an app name" >&2
@@ -2605,7 +2812,7 @@ read_page() {
     fi
 
     # Format output using Python
-    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" << 'PYEOF'
+    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" "$region" "$aspect" << 'PYEOF'
 import json
 import sys
 
@@ -2618,6 +2825,47 @@ classify = sys.argv[6] == "true"
 json_output = sys.argv[7] == "true"
 image_json = sys.argv[8] if len(sys.argv) > 8 else ""
 bubble_info = sys.argv[9] if len(sys.argv) > 9 else ""
+region_str = sys.argv[10] if len(sys.argv) > 10 else ""
+aspect_mode = sys.argv[11] == "true" if len(sys.argv) > 11 else False
+
+# Aspect transformation: convert to square coordinate space
+win_w_f = float(win_w) if win_w else 0
+win_h_f = float(win_h) if win_h else 0
+
+def to_aspect_coords(x, y, w, h):
+    """Transform percentages to square coordinate space."""
+    if not aspect_mode or win_w_f == 0 or win_h_f == 0:
+        return x, y, w, h
+
+    min_dim = min(win_w_f, win_h_f)
+    # Offsets in percentage terms
+    off_x_pct = (win_w_f - min_dim) / 2 * 100 / win_w_f
+    off_y_pct = (win_h_f - min_dim) / 2 * 100 / win_h_f
+    # Scale factor (how much bigger is original space vs square space)
+    scale_x = win_w_f / min_dim
+    scale_y = win_h_f / min_dim
+
+    new_x = (x - off_x_pct) * scale_x
+    new_y = (y - off_y_pct) * scale_y
+    new_w = w * scale_x
+    new_h = h * scale_y
+    return new_x, new_y, new_w, new_h
+
+region = None
+if region_str:
+    try:
+        parts = [float(x) for x in region_str.split(',')]
+        if len(parts) == 4:
+            region = {'x1': parts[0], 'y1': parts[1], 'x2': parts[2], 'y2': parts[3]}
+    except:
+        pass
+
+def in_region(bounds_pct, region):
+    if not region:
+        return True
+    cx = bounds_pct.get('x', 0) + bounds_pct.get('width', 0) / 2
+    cy = bounds_pct.get('y', 0) + bounds_pct.get('height', 0) / 2
+    return (region['x1'] <= cx <= region['x2'] and region['y1'] <= cy <= region['y2'])
 
 # Parse text elements from OCR
 try:
@@ -2631,22 +2879,26 @@ try:
 except:
     image_elements = []
 
-# Merge text and images into unified elements list
+# Merge text and images into unified elements list, applying region filter
 elements = []
 for e in text_elements:
-    elements.append({
-        'type': 'text',
-        'bounds_pct': e.get('bounds_pct', {}),
-        'text': e.get('text', '')
-    })
+    bounds = e.get('bounds_pct', {})
+    if in_region(bounds, region):
+        elements.append({
+            'type': 'text',
+            'bounds_pct': bounds,
+            'text': e.get('text', '')
+        })
 
 for img in image_elements:
-    elements.append({
-        'type': 'image',
-        'bounds_pct': img.get('bounds_pct', {}),
-        'path': img.get('path', ''),
-        'description': img.get('description', 'Image')
-    })
+    bounds = img.get('bounds_pct', {})
+    if in_region(bounds, region):
+        elements.append({
+            'type': 'image',
+            'bounds_pct': bounds,
+            'path': img.get('path', ''),
+            'description': img.get('description', 'Image')
+        })
 
 # Sort by position (top-to-bottom, left-to-right reading order)
 def sort_key(e):
@@ -2670,10 +2922,11 @@ if json_output:
     }
     for e in elements:
         b = e.get('bounds_pct', {})
-        x = round(b.get('x', 0), 1)
-        y = round(b.get('y', 0), 1)
-        w = round(b.get('width', 0), 1)
-        h = round(b.get('height', 0), 1)
+        x, y, w, h = to_aspect_coords(
+            b.get('x', 0), b.get('y', 0),
+            b.get('width', 0), b.get('height', 0)
+        )
+        x, y, w, h = round(x, 1), round(y, 1), round(w, 1), round(h, 1)
         if e['type'] == 'image':
             elem = {
                 "b": [x, y, w, h],
@@ -2690,16 +2943,18 @@ if json_output:
     print(json.dumps(output, indent=2))
 else:
     # Line-oriented format: [x,y,w,h] where x,y is top-left corner
-    print(f"@page {app} display:{display} viewport:{win_w}x{win_h}")
+    aspect_flag = " --aspect" if aspect_mode else ""
+    print(f"@page {app} display:{display} viewport:{win_w}x{win_h}{aspect_flag}")
     # Include bubble position info if running (helps LLM avoid obscured areas)
     if bubble_info:
         print(bubble_info)
     for e in elements:
         b = e.get('bounds_pct', {})
-        x = round(b.get('x', 0), 1)
-        y = round(b.get('y', 0), 1)
-        w = round(b.get('width', 0), 1)
-        h = round(b.get('height', 0), 1)
+        x, y, w, h = to_aspect_coords(
+            b.get('x', 0), b.get('y', 0),
+            b.get('width', 0), b.get('height', 0)
+        )
+        x, y, w, h = round(x, 1), round(y, 1), round(w, 1), round(h, 1)
         if e['type'] == 'image':
             path = e.get('path', '')
             desc = e.get('description', 'Image')
@@ -2751,7 +3006,13 @@ run_chain() {
     # Restore persistent target app if set (enables OCR output at chain end)
     restore_target_app
 
-    for cmd in "$@"; do
+    # Convert args to array for index-based access (needed for lookahead)
+    local -a actions=("$@")
+    local i=0
+    local num_actions=${#actions[@]}
+
+    while [[ $i -lt $num_actions ]]; do
+        local cmd="${actions[$i]}"
         local action="${cmd%%:*}"
         local arg="${cmd#*:}"
 
@@ -2820,29 +3081,9 @@ run_chain() {
                 echo "Chain: Waiting ${arg}ms"
                 wait_ms "$arg"
                 ;;
-            focus)
-                # Focus on region and detect elements for positional clicking
-                # Usage: focus:x,y,w,h (percentages)
-                # Stores detected elements in FOCUS_ELEMENTS for click:left/right/top/bottom
-                echo "Chain: Focusing on region $arg"
-                FOCUS_ELEMENTS=""  # Clear previous focus
-                focus_region "$arg"
-                wait_ms "$default_delay"
-                ;;
             click)
-                # Check if arg is a positional reference (left, right, top, bottom)
-                local click_coords="$arg"
-                if [[ "$arg" =~ ^(left|right|top|bottom) ]]; then
-                    echo "Chain: Resolving positional click '$arg'"
-                    click_coords=$(get_focus_element "$arg")
-                    if [[ $? -ne 0 || -z "$click_coords" ]]; then
-                        echo "Chain: FAILED - could not resolve position '$arg'" >&2
-                        return 1
-                    fi
-                    echo "Chain: Resolved to $click_coords"
-                fi
-                echo "Chain: Clicking at $click_coords"
-                click_grid "$click_coords" "c"
+                echo "Chain: Clicking at $arg"
+                click_grid "$arg" "c"
                 wait_ms "$default_delay"
                 needs_auto_wait=1  # Navigation action - auto-wait for page change
                 ;;
@@ -2895,182 +3136,141 @@ run_chain() {
                 click_grid "$arg" "rc"
                 wait_ms "$default_delay"
                 ;;
+            drag-easing)
+                # Set easing for drags: linear, ease-in, ease-out, ease-in-out
+                case "$arg" in
+                    linear|ease-in|ease-out|ease-in-out)
+                        DRAG_EASING="$arg"
+                        echo "Chain: Drag easing set to $arg"
+                        ;;
+                    *)
+                        echo "Chain: ERROR - drag-easing must be linear, ease-in, ease-out, or ease-in-out"
+                        return 1
+                        ;;
+                esac
+                ;;
+            drag-steps)
+                # Set number of interpolation steps (10-500)
+                if [[ "$arg" =~ ^[0-9]+$ && "$arg" -ge 10 && "$arg" -le 500 ]]; then
+                    DRAG_STEPS="$arg"
+                    echo "Chain: Drag steps set to $arg"
+                else
+                    echo "Chain: ERROR - drag-steps must be a number between 10 and 500"
+                    return 1
+                fi
+                ;;
+            aspect)
+                # Enable aspect ratio correction (square coordinate space)
+                # Optional: aspect:x1,y1,x2,y2 to specify region
+                ASPECT_CORRECT="1"
+                if [[ -n "$arg" && "$arg" =~ ^[0-9] ]]; then
+                    REGION="$arg"
+                    echo "Chain: Aspect correction enabled (region $REGION)"
+                else
+                    echo "Chain: Aspect correction enabled (full window)"
+                fi
+                ;;
+            arc)
+                # Set arc parameters for next drag
+                # Format: arc:position:tension (e.g., arc:90:0, arc:-90:100)
+                if [[ "$arg" =~ ^(-?[0-9]+):(-?[0-9]+)$ ]]; then
+                    ARC_POSITION="${BASH_REMATCH[1]}"
+                    ARC_TENSION="${BASH_REMATCH[2]}"
+                    local abs_pos=${ARC_POSITION#-}
+                    if [[ $abs_pos -lt 1 || $abs_pos -gt 179 ]]; then
+                        echo "Chain: ERROR - Arc position must be ±1 to ±179 (got $ARC_POSITION)"
+                        return 1
+                    fi
+                    echo "Chain: Arc set (pos=$ARC_POSITION, tension=$ARC_TENSION) - applies to next drag"
+                else
+                    echo "Chain: ERROR - arc requires format position:tension (e.g., arc:90:0)"
+                    return 1
+                fi
+                ;;
+            dragend)
+                # Explicit mouse release for drag chaining
+                if [[ -n "$DRAG_MOUSE_DOWN" ]]; then
+                    echo "Chain: Ending drag (releasing mouse)"
+                    "$PYTHON" <<'PYEOF'
+from Quartz import CGEventCreateMouseEvent, CGEventPost, kCGEventLeftMouseUp, kCGHIDEventTap, CGEventGetLocation, CGEventCreate
+event = CGEventCreate(None)
+loc = CGEventGetLocation(event)
+up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, loc, 0)
+CGEventPost(kCGHIDEventTap, up_event)
+PYEOF
+                    DRAG_MOUSE_DOWN=""
+                else
+                    echo "Chain: dragend - no drag in progress"
+                fi
+                ;;
             drag)
                 # Format: drag:x1,y1,x2,y2 or drag:x1,y1,w,h,x2,y2 (box to point)
-                echo "Chain: Dragging $arg"
-                drag_mouse "$arg"
-                wait_ms "$default_delay"
-                ;;
-            drag-text)
-                # Format: drag-text:text,x,y - find text and drag to point
-                local drag_search="${arg%%,*}"
-                local drag_dest="${arg#*,}"
-                # Split remaining arg on first comma to get x,y
-                if [[ "$drag_search" == "$drag_dest" || -z "$drag_dest" ]]; then
-                    echo "Chain: ERROR - drag-text requires format: text,x,y" >&2
-                    return 1
-                fi
-                echo "Chain: Dragging '$drag_search' to $drag_dest${IN_APP:+ (in $IN_APP)}"
-                drag_text "$drag_search" "$drag_dest"
-                wait_ms "$default_delay"
-                ;;
-            drag-text-to-text)
-                # Format: drag-text-to-text:source|target - drag source text to target text
-                local drag_source="${arg%%|*}"
-                local drag_target="${arg#*|}"
-                if [[ "$drag_source" == "$drag_target" || -z "$drag_target" ]]; then
-                    echo "Chain: ERROR - drag-text-to-text requires format: source|target" >&2
-                    return 1
-                fi
-                echo "Chain: Dragging '$drag_source' to '$drag_target'${IN_APP:+ (in $IN_APP)}"
-                drag_text_to_text "$drag_source" "$drag_target"
-                wait_ms "$default_delay"
-                ;;
-            drag-focus)
-                # Drag a focus-detected element
-                # Formats:
-                #   drag-focus:pos,x,y     - drag element to coordinates
-                #   drag-focus:from,to     - drag between two elements (positions or IDs)
-                local parts=()
-                IFS=',' read -ra parts <<< "$arg"
+                # BATCH consecutive drags into single Python call to avoid pauses
 
-                if [[ ${#parts[@]} -eq 3 ]]; then
-                    # Format: position,x,y - drag element to coordinates
-                    local src_pos="${parts[0]}"
-                    local dest_x="${parts[1]}"
-                    local dest_y="${parts[2]}"
+                # Restore target app once at start
+                restore_target_app
 
-                    local src_coords
-                    src_coords=$(get_focus_element "$src_pos")
-                    if [[ $? -ne 0 ]]; then
-                        echo "Chain: ERROR - Failed to resolve focus position '$src_pos'" >&2
-                        return 1
+                # Collect all consecutive drag+arc actions
+                local -a batch_segments=()
+                local scan_i=$i
+
+                while [[ $scan_i -lt $num_actions ]]; do
+                    local scan_cmd="${actions[$scan_i]}"
+                    local scan_action="${scan_cmd%%:*}"
+                    local scan_arg="${scan_cmd#*:}"
+                    [[ "$scan_action" == "$scan_arg" ]] && scan_arg=""
+
+                    if [[ "$scan_action" == "drag" ]]; then
+                        local drag_coords="$scan_arg"
+                        local arc_pos=0
+                        local arc_ten=0
+
+                        # Check if next action is arc: (modifies this drag)
+                        local peek_i=$((scan_i + 1))
+                        if [[ $peek_i -lt $num_actions ]]; then
+                            local peek_cmd="${actions[$peek_i]}"
+                            local peek_action="${peek_cmd%%:*}"
+                            local peek_arg="${peek_cmd#*:}"
+                            if [[ "$peek_action" == "arc" ]]; then
+                                if [[ "$peek_arg" =~ ^(-?[0-9]+):(-?[0-9]+)$ ]]; then
+                                    arc_pos="${BASH_REMATCH[1]}"
+                                    arc_ten="${BASH_REMATCH[2]}"
+                                    scan_i=$((scan_i + 1))  # Consume arc
+                                fi
+                            fi
+                        fi
+
+                        # Convert to pixel coordinates
+                        local pixels=$(drag_coords_to_pixels "$drag_coords")
+                        if [[ -n "$pixels" ]]; then
+                            # Format: x1,y1,x2,y2,arc_pos,arc_tension
+                            batch_segments+=("$pixels,$arc_pos,$arc_ten")
+                            echo "Chain: Batching drag $drag_coords${arc_pos:+ (arc:$arc_pos:$arc_ten)}" >&2
+                        fi
+
+                        scan_i=$((scan_i + 1))
+
+                        # Check if next is also a drag (continue batching)
+                        if [[ $scan_i -lt $num_actions ]]; then
+                            local next_cmd="${actions[$scan_i]}"
+                            local next_action="${next_cmd%%:*}"
+                            [[ "$next_action" != "drag" ]] && break
+                        fi
+                    else
+                        break
                     fi
-
-                    echo "Chain: Dragging focus '$src_pos' to $dest_x,$dest_y"
-                    drag_mouse "$src_coords,$dest_x,$dest_y"
-
-                elif [[ ${#parts[@]} -eq 2 ]]; then
-                    # Format: from,to - drag between elements
-                    local src_pos="${parts[0]}"
-                    local dest_pos="${parts[1]}"
-
-                    local src_coords
-                    src_coords=$(get_focus_element "$src_pos")
-                    if [[ $? -ne 0 ]]; then
-                        echo "Chain: ERROR - Failed to resolve focus position '$src_pos'" >&2
-                        return 1
-                    fi
-
-                    local dest_coords
-                    dest_coords=$(get_focus_element "$dest_pos")
-                    if [[ $? -ne 0 ]]; then
-                        echo "Chain: ERROR - Failed to resolve focus position '$dest_pos'" >&2
-                        return 1
-                    fi
-
-                    # Extract destination center from x,y,w,h
-                    local dest_x dest_y dest_w dest_h
-                    IFS=',' read -r dest_x dest_y dest_w dest_h <<< "$dest_coords"
-                    local dest_center_x=$(awk "BEGIN {printf \"%.1f\", $dest_x + $dest_w / 2}")
-                    local dest_center_y=$(awk "BEGIN {printf \"%.1f\", $dest_y + $dest_h / 2}")
-
-                    echo "Chain: Dragging focus '$src_pos' to '$dest_pos'"
-                    drag_mouse "$src_coords,$dest_center_x,$dest_center_y"
-                else
-                    echo "Chain: ERROR - drag-focus requires format: pos,x,y or from,to" >&2
-                    return 1
-                fi
-                wait_ms "$default_delay"
-                ;;
-            drag-focus-to-text)
-                # Format: drag-focus-to-text:position|target_text
-                # Drag a focus-detected element to OCR text
-                local src_pos="${arg%%|*}"
-                local target_text="${arg#*|}"
-
-                if [[ "$src_pos" == "$target_text" || -z "$target_text" ]]; then
-                    echo "Chain: ERROR - drag-focus-to-text requires format: position|text" >&2
-                    return 1
-                fi
-
-                local src_coords
-                src_coords=$(get_focus_element "$src_pos")
-                if [[ $? -ne 0 ]]; then
-                    echo "Chain: ERROR - Failed to resolve focus position '$src_pos'" >&2
-                    return 1
-                fi
-
-                echo "Chain: Dragging focus '$src_pos' to text '$target_text'"
-
-                # Find target text using OCR
-                local coords_file="/tmp/drag_focus_text_$$.txt"
-                local find_timeout="${OCR_TIMEOUT:-10}"
-
-                ( INSTANCE_EXPLICIT=1 find_text_on_screen "$target_text" "${INSTANCE:-1}" "$DISPLAY_NUM" "$IN_APP" "$NEAR_TEXT" > "$coords_file" ) &
-                local find_pid=$!
-
-                local waited=0
-                while kill -0 $find_pid 2>/dev/null && [[ $waited -lt $((find_timeout * 5)) ]]; do
-                    sleep 0.2
-                    waited=$((waited + 1))
                 done
 
-                if kill -0 $find_pid 2>/dev/null; then
-                    pkill -P $find_pid 2>/dev/null
-                    kill $find_pid 2>/dev/null
-                    wait $find_pid 2>/dev/null
-                    rm -f "$coords_file"
-                    echo "Chain: ERROR - Text search timed out" >&2
-                    return 1
+                # Execute batch
+                if [[ ${#batch_segments[@]} -gt 0 ]]; then
+                    echo "Chain: Executing ${#batch_segments[@]} drag segments in batch"
+                    drag_batch "${batch_segments[@]}"
                 fi
 
-                wait $find_pid
-                local target_coords=$(cat "$coords_file" 2>/dev/null)
-                rm -f "$coords_file"
+                # Update loop index to skip consumed actions
+                i=$((scan_i - 1))  # -1 because loop will increment
 
-                if [[ -z "$target_coords" || "$target_coords" == *"NOT_FOUND"* || "$target_coords" == *"ERROR"* ]]; then
-                    echo "Chain: ERROR - Text not found: '$target_text'" >&2
-                    return 1
-                fi
-
-                # Extract target center from x,y,w,h
-                local tx ty tw th
-                IFS=',' read -r tx ty tw th <<< "$target_coords"
-                local target_center_x=$(awk "BEGIN {printf \"%.1f\", $tx + ${tw:-0} / 2}")
-                local target_center_y=$(awk "BEGIN {printf \"%.1f\", $ty + ${th:-0} / 2}")
-
-                drag_mouse "$src_coords,$target_center_x,$target_center_y"
-                wait_ms "$default_delay"
-                ;;
-            drag-to-focus)
-                # Format: drag-to-focus:x,y,position
-                # Drag from coordinates to a focus-detected element
-                local src_x="${arg%%,*}"
-                local rest="${arg#*,}"
-                local src_y="${rest%%,*}"
-                local dest_pos="${rest#*,}"
-
-                if [[ -z "$src_x" || -z "$src_y" || -z "$dest_pos" || "$src_y" == "$dest_pos" ]]; then
-                    echo "Chain: ERROR - drag-to-focus requires format: x,y,position" >&2
-                    return 1
-                fi
-
-                local dest_coords
-                dest_coords=$(get_focus_element "$dest_pos")
-                if [[ $? -ne 0 ]]; then
-                    echo "Chain: ERROR - Failed to resolve focus position '$dest_pos'" >&2
-                    return 1
-                fi
-
-                # Extract destination center from x,y,w,h
-                local dest_x dest_y dest_w dest_h
-                IFS=',' read -r dest_x dest_y dest_w dest_h <<< "$dest_coords"
-                local dest_center_x=$(awk "BEGIN {printf \"%.1f\", $dest_x + $dest_w / 2}")
-                local dest_center_y=$(awk "BEGIN {printf \"%.1f\", $dest_y + $dest_h / 2}")
-
-                echo "Chain: Dragging $src_x,$src_y to focus '$dest_pos'"
-                drag_mouse "$src_x,$src_y,$dest_center_x,$dest_center_y"
+                DRAG_MOUSE_DOWN=""
                 wait_ms "$default_delay"
                 ;;
             double-click)
@@ -3572,6 +3772,7 @@ PYEOF
                         echo "Chain: Use goto:$search_term:N to select (e.g., goto:$search_term:1)"
                         # Don't switch - return early
                         wait_ms "$default_delay"
+                        i=$((i + 1))
                         continue
                     fi
                 else
@@ -3600,7 +3801,24 @@ PYEOF
                 return 1
                 ;;
         esac
+
+        # Increment index for next iteration
+        i=$((i + 1))
     done
+
+    # Release mouse if held from drag chaining
+    if [[ -n "$DRAG_MOUSE_DOWN" ]]; then
+        echo "Chain: Releasing held mouse button" >&2
+        # Release mouse at current position using Python
+        "$PYTHON" <<'PYEOF'
+from Quartz import CGEventCreateMouseEvent, CGEventPost, kCGEventLeftMouseUp, kCGHIDEventTap, CGEventGetLocation, CGEventCreate
+event = CGEventCreate(None)
+loc = CGEventGetLocation(event)
+up_event = CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, loc, 0)
+CGEventPost(kCGHIDEventTap, up_event)
+PYEOF
+        DRAG_MOUSE_DOWN=""
+    fi
 
     echo "Chain: Complete" >&2
     IN_CHAIN=""  # Clear chain flag
@@ -3613,8 +3831,9 @@ PYEOF
         local read_output=""
 
         # Use background process with timeout (macOS compatible)
+        # Pass REGION for filtering if set
         read_output=$(
-            ( read_page "$IN_APP" ) &
+            ( read_page "$IN_APP" "false" "false" "" "$REGION" ) &
             local pid=$!
             ( sleep "$timeout_sec"; kill $pid 2>/dev/null ) &
             local killer=$!
@@ -3957,6 +4176,14 @@ main() {
                 echo "Target app cleared"
                 shift
                 ;;
+            --region)
+                REGION="$2"
+                shift 2
+                ;;
+            --clear-region)
+                REGION=""
+                shift
+                ;;
             --show-cursor)
                 show_cursor
                 shift
@@ -4000,16 +4227,13 @@ main() {
             --drag-speed)
                 case "$2" in
                     slow)
-                        DRAG_STEP_MS=50
-                        DRAG_STEPS=30
+                        DRAG_DURATION=2.5
                         ;;
                     normal)
-                        DRAG_STEP_MS=25
-                        DRAG_STEPS=20
+                        DRAG_DURATION=1.6
                         ;;
                     fast)
-                        DRAG_STEP_MS=10
-                        DRAG_STEPS=15
+                        DRAG_DURATION=0.6
                         ;;
                     *)
                         echo "ERROR: --drag-speed must be slow, normal, or fast"
@@ -4018,13 +4242,59 @@ main() {
                 esac
                 shift 2
                 ;;
-            --drag-text)
-                drag_text "$2" "$3"
-                shift 3
+            --arc)
+                # Parse position:tension format
+                local arc_param="$2"
+                if [[ "$arc_param" =~ ^(-?[0-9]+):(-?[0-9]+)$ ]]; then
+                    ARC_POSITION="${BASH_REMATCH[1]}"
+                    ARC_TENSION="${BASH_REMATCH[2]}"
+                    # Validate position range (±1 to ±179)
+                    local abs_pos=${ARC_POSITION#-}
+                    if [[ $abs_pos -lt 1 || $abs_pos -gt 179 ]]; then
+                        echo "ERROR: Arc position must be ±1 to ±179 (got $ARC_POSITION)"
+                        exit 1
+                    fi
+                    echo "Arc: position=$ARC_POSITION tension=$ARC_TENSION"
+                else
+                    echo "ERROR: --arc requires format position:tension (e.g., 90:0, -90:100)"
+                    exit 1
+                fi
+                shift 2
                 ;;
-            --drag-text-to-text)
-                drag_text_to_text "$2" "$3"
-                shift 3
+            --drag-easing)
+                case "$2" in
+                    linear|ease-in|ease-out|ease-in-out)
+                        DRAG_EASING="$2"
+                        echo "Drag easing: $DRAG_EASING"
+                        ;;
+                    *)
+                        echo "ERROR: --drag-easing must be linear, ease-in, ease-out, or ease-in-out"
+                        exit 1
+                        ;;
+                esac
+                shift 2
+                ;;
+            --drag-steps)
+                if [[ "$2" =~ ^[0-9]+$ && "$2" -ge 10 && "$2" -le 500 ]]; then
+                    DRAG_STEPS="$2"
+                    echo "Drag steps: $DRAG_STEPS"
+                else
+                    echo "ERROR: --drag-steps must be a number between 10 and 500"
+                    exit 1
+                fi
+                shift 2
+                ;;
+            --aspect)
+                ASPECT_CORRECT="1"
+                # Optional region argument (x1,y1,x2,y2)
+                if [[ -n "$2" && "$2" =~ ^[0-9]+(\.[0-9]+)?,.*,.*,.*$ ]]; then
+                    REGION="$2"
+                    echo "Aspect correction: enabled (region $REGION)"
+                    shift 2
+                else
+                    echo "Aspect correction: enabled (full window)"
+                    shift
+                fi
                 ;;
             --type)
                 local fast_flag=""
@@ -4293,19 +4563,13 @@ main() {
                     shift
                 fi
                 ;;
-            --focus)
-                if [[ -z "$2" || "$2" == --* ]]; then
-                    echo "ERROR: --focus requires region as x,y,w,h (percentages)" >&2
-                    exit 1
-                fi
-                focus_region "$2"
-                shift 2
-                ;;
             --read-page)
                 local rp_app=""
                 local rp_classify="false"
                 local rp_json="false"
                 local rp_save=""
+                local rp_region=""
+                local rp_aspect="false"
                 shift  # shift past --read-page
                 # Check if next arg is an app name (not a flag)
                 if [[ $# -gt 0 && "$1" != --* ]]; then
@@ -4325,10 +4589,16 @@ main() {
                         --json) rp_json="true"; shift ;;
                         --save-screenshot) rp_save="$2"; shift 2 ;;
                         --no-images) DETECT_IMAGES=0; shift ;;
+                        --region) rp_region="$2"; shift 2 ;;
+                        --aspect) rp_aspect="true"; shift ;;
                         *) break ;;
                     esac
                 done
-                read_page "$rp_app" "$rp_classify" "$rp_json" "$rp_save"
+                # Use global REGION if local not set
+                [[ -z "$rp_region" && -n "$REGION" ]] && rp_region="$REGION"
+                # Use global ASPECT_CORRECT if local not set
+                [[ "$rp_aspect" == "false" && -n "$ASPECT_CORRECT" ]] && rp_aspect="true"
+                read_page "$rp_app" "$rp_classify" "$rp_json" "$rp_save" "$rp_region" "$rp_aspect"
                 ;;
             --instance)
                 INSTANCE="$2"

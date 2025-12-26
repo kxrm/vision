@@ -28,14 +28,14 @@ The subagent can:
 ## Invocation
 
 ```
-/agent game-controller --game "Snake" --target green --self blue
+/agent game-controller --in-app "Snake" --target green --self blue
 ```
 
 ## Configuration
 
 | Parameter | Description |
 |-----------|-------------|
-| `--game <app>` | Application name |
+| `--in-app <app>` | Target application name |
 | `--target <color>` | Color to track |
 | `--self <color>` | Player color |
 | `--strategy <type>` | Initial strategy (chase/flee/mirror/patrol) |

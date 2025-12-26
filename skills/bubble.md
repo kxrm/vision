@@ -206,7 +206,7 @@ name=$(echo "$response" | jq -r '.text')
 | `--near <text>` | Find text closest to anchor (use with `--point-at-text`) |
 | `--arrow <direction>` | Hint arrow direction: left, right, up, down |
 | `--in-app <name>` | Target app for coordinate translation |
-| `--status` | Show dependencies |
+| `--status` | Show dependencies (no args) or set status line (`--status "text"`) |
 
 ## Pointing at UI Elements
 
