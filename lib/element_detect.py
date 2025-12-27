@@ -7,8 +7,10 @@ Uses Vision framework rectangle detection + contrast analysis.
 import sys
 import json
 import argparse
+import hashlib
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+import subprocess
 
 import Quartz
 from Foundation import NSURL
@@ -115,7 +117,8 @@ def detect_contrast_regions(image_path: str, min_size_px: int = 12, max_size_px:
             edge_mean = stat.mean[0]
 
             # High edge density indicates potential element boundary
-            if edge_mean > 30:  # Threshold for "interesting" region
+            # Lower threshold (20) catches subtle icons like moon/sun toggles
+            if edge_mean > 20:
                 regions.append({
                     'x': round(x * 100 / width, 1),
                     'y': round(y * 100 / height, 1),
@@ -125,9 +128,10 @@ def detect_contrast_regions(image_path: str, min_size_px: int = 12, max_size_px:
                     'source': 'contrast'
                 })
 
-    # Cluster overlapping/adjacent regions into elements, filter noise
-    # 2% margin connects cells that nearly touch
-    return cluster_regions(regions, overlap_margin_pct=2.0, min_cluster_size=2)
+    # Cluster overlapping/adjacent regions into elements
+    # Use tight margin (0.5%) to avoid merging distant elements
+    # min_cluster_size=1 allows single-cell icons (small toggles)
+    return cluster_regions(regions, overlap_margin_pct=0.5, min_cluster_size=1)
 
 
 def cluster_regions(regions: List[Dict], overlap_margin_pct: float = 2.0,
@@ -274,16 +278,18 @@ def detect_elements(image_path: str,
     return elements
 
 
-def filter_edge_elements(regions: List[Dict], edge_margin_pct: float = 2.0) -> List[Dict]:
+def filter_edge_elements(regions: List[Dict], edge_margin_pct: float = 2.0,
+                         filter_bottom: bool = False) -> List[Dict]:
     """
     Filter out elements that touch the region boundary.
 
-    Elements clipped at edges are likely boundary artifacts from adjacent UI,
-    not intentional targets. Real icons should be comfortably inside the focus area.
+    By default, only filters TOP edge (browser chrome) since bottom toolbars
+    contain legitimate icons (dark mode toggles, settings, etc.).
 
     Args:
         regions: List of regions with x, y, w, h (percentages 0-100)
         edge_margin_pct: How close to edge counts as "touching" (default 2%)
+        filter_bottom: Also filter bottom edge (default False - keeps toolbar icons)
 
     Returns:
         Filtered list excluding edge-touching elements
@@ -292,13 +298,11 @@ def filter_edge_elements(regions: List[Dict], edge_margin_pct: float = 2.0) -> L
     for r in regions:
         x, y, w, h = r['x'], r['y'], r['w'], r['h']
 
-        # Check if element touches any edge
-        touches_left = x < edge_margin_pct
-        touches_right = (x + w) > (100 - edge_margin_pct)
+        # Only filter top edge by default (browser chrome artifacts)
+        # Bottom toolbars contain legitimate icons we want to detect
         touches_top = y < edge_margin_pct
-        touches_bottom = (y + h) > (100 - edge_margin_pct)
 
-        if not (touches_left or touches_right or touches_top or touches_bottom):
+        if not touches_top:
             filtered.append(r)
 
     return filtered
@@ -319,27 +323,204 @@ def classify_element(region: Dict) -> str:
         return 'region'
 
 
+def describe_icon(crop: Image.Image) -> str:
+    """
+    Generate a short description of an icon based on fast visual analysis.
+
+    Args:
+        crop: PIL Image of the icon
+
+    Returns:
+        Short description string (color info only - fast)
+    """
+    # Get basic color info
+    if crop.mode != 'RGB':
+        crop_rgb = crop.convert('RGB')
+    else:
+        crop_rgb = crop
+
+    # Sample colors (subsample for speed)
+    pixels = list(crop_rgb.getdata())[::4]  # Every 4th pixel
+    if not pixels:
+        return ""
+
+    # Find dominant color (most common non-gray color)
+    from collections import Counter
+    color_counts = Counter()
+    for r, g, b in pixels:
+        # Check if it's a saturated color (not gray)
+        max_c, min_c = max(r, g, b), min(r, g, b)
+        if max_c - min_c > 50:  # Has color saturation
+            if r > g and r > b:
+                color_counts['red'] += 1
+            elif g > r and g > b:
+                color_counts['green'] += 1
+            elif b > r and b > g:
+                color_counts['blue'] += 1
+            elif r > 180 and g > 180 and b < 120:
+                color_counts['yellow'] += 1
+            elif r > 180 and b > 180 and g < 120:
+                color_counts['magenta'] += 1
+            elif g > 180 and b > 180 and r < 120:
+                color_counts['cyan'] += 1
+            elif r > 200 and g > 100 and g < 180 and b < 100:
+                color_counts['orange'] += 1
+
+    if color_counts:
+        # Return dominant color if significant
+        dominant, count = color_counts.most_common(1)[0]
+        if count > len(pixels) * 0.1:  # At least 10% of pixels
+            return dominant
+
+    return ""
+
+
+def extract_icon(image: Image.Image, bbox: List[float],
+                 output_dir: str = "/tmp", max_size: int = 128) -> Tuple[str, str]:
+    """
+    Extract icon region to a file for LLM viewing.
+
+    Args:
+        image: Source PIL Image
+        bbox: Bounding box as [x, y, w, h] in percentages
+        output_dir: Directory for extracted icons
+        max_size: Maximum dimension in pixels (default 128)
+
+    Returns:
+        Tuple of (path to extracted icon file, description)
+    """
+    img_w, img_h = image.size
+
+    x = int(bbox[0] * img_w / 100)
+    y = int(bbox[1] * img_h / 100)
+    w = int(bbox[2] * img_w / 100)
+    h = int(bbox[3] * img_h / 100)
+
+    # Add small padding around icon (2px)
+    pad = 2
+    x = max(0, x - pad)
+    y = max(0, y - pad)
+    w = min(img_w - x, w + 2 * pad)
+    h = min(img_h - y, h + 2 * pad)
+
+    # Ensure valid bounds
+    if w < 4 or h < 4:
+        return "", ""
+
+    crop = image.crop((x, y, x + w, y + h))
+
+    # Generate description before resizing (better quality for analysis)
+    description = describe_icon(crop)
+
+    # Resize if larger than max_size while preserving aspect ratio
+    if max(crop.width, crop.height) > max_size:
+        ratio = max_size / max(crop.width, crop.height)
+        new_w = max(1, int(crop.width * ratio))
+        new_h = max(1, int(crop.height * ratio))
+        crop = crop.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+    # Generate unique filename based on content hash
+    crop_bytes = crop.tobytes()
+    hash_suffix = hashlib.md5(crop_bytes).hexdigest()[:8]
+    filename = f"icon_{hash_suffix}.jpg"
+    output_path = Path(output_dir) / filename
+
+    # Save as JPEG
+    if crop.mode == 'RGBA':
+        crop = crop.convert('RGB')
+    crop.save(output_path, 'JPEG', quality=90)
+
+    return str(output_path), description
+
+
+def detect_and_extract_icons(image_path: str,
+                             min_size_pct: float = 0.5,
+                             max_size_pct: float = 8.0,
+                             output_dir: str = "/tmp") -> List[Dict]:
+    """
+    Detect and extract icons from an image.
+
+    Args:
+        image_path: Path to image
+        min_size_pct: Minimum element size as % of image area
+        max_size_pct: Maximum element size as % of image area
+        output_dir: Directory for extracted icon images
+
+    Returns:
+        List of icons with bbox, type, and path to extracted image
+    """
+    # Load image for extraction
+    try:
+        image = Image.open(image_path)
+    except Exception:
+        return []
+
+    # Detect elements using existing pipeline
+    elements = detect_elements(image_path, min_size_pct, max_size_pct * max_size_pct)
+
+    # Filter to only icon-sized elements and extract them
+    icons = []
+    for elem in elements:
+        if elem['type'] in ('small-icon', 'icon', 'button'):
+            bbox = elem['bbox']
+            path, description = extract_icon(image, bbox, output_dir)
+            if path:
+                icon_data = {
+                    'bbox': bbox,
+                    'type': elem['type'],
+                    'path': path
+                }
+                if description:
+                    icon_data['desc'] = description
+                icons.append(icon_data)
+
+    return icons
+
+
 def main():
     parser = argparse.ArgumentParser(description='Detect UI elements in image region')
     parser.add_argument('--image', required=True, help='Path to image')
     parser.add_argument('--json', action='store_true', help='Output as JSON')
-    parser.add_argument('--min-size', type=float, default=1.0, help='Min element size %%')
-    parser.add_argument('--max-size', type=float, default=50.0, help='Max element size %%')
+    parser.add_argument('--extract', action='store_true',
+                        help='Extract icons to files (returns paths)')
+    parser.add_argument('--output-dir', default='/tmp',
+                        help='Directory for extracted icons (default: /tmp)')
+    parser.add_argument('--min-size', type=float, default=0.5,
+                        help='Min element size %% (default: 0.5)')
+    parser.add_argument('--max-size', type=float, default=8.0,
+                        help='Max element size %% for icons (default: 8.0)')
 
     args = parser.parse_args()
 
-    elements = detect_elements(
-        args.image,
-        min_size_pct=args.min_size,
-        max_size_pct=args.max_size
-    )
+    if args.extract:
+        # Detect and extract icons to files
+        icons = detect_and_extract_icons(
+            args.image,
+            min_size_pct=args.min_size,
+            max_size_pct=args.max_size,
+            output_dir=args.output_dir
+        )
 
-    if args.json:
-        print(json.dumps(elements, indent=2))
+        if args.json:
+            print(json.dumps(icons, indent=2))
+        else:
+            for icon in icons:
+                bbox = ','.join(str(round(v, 1)) for v in icon['bbox'])
+                print(f"[{bbox}] {icon['type']} -> {icon['path']}")
     else:
-        for elem in elements:
-            bbox = ','.join(str(round(v, 1)) for v in elem['bbox'])
-            print(f"[{elem['id']}] {bbox} {elem['type']}")
+        # Detection only (no extraction)
+        elements = detect_elements(
+            args.image,
+            min_size_pct=args.min_size,
+            max_size_pct=args.max_size * args.max_size  # Convert to area
+        )
+
+        if args.json:
+            print(json.dumps(elements, indent=2))
+        else:
+            for elem in elements:
+                bbox = ','.join(str(round(v, 1)) for v in elem['bbox'])
+                print(f"[{elem['id']}] {bbox} {elem['type']}")
 
 
 if __name__ == '__main__':

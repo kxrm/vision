@@ -303,15 +303,16 @@ Use `--arc` with `--drag` to draw curved paths. Combine with `--aspect` for geom
 ```bash
 # Draw a perfect circle (4 quarter arcs, auto-chained)
 ./bin/interact.sh --in-app Firefox --aspect 5,38,56,79 --chain \
-  "drag:80,50,50,20" "arc:-90:0" \
-  "drag:50,20,20,50" "arc:-90:0" \
-  "drag:20,50,50,80" "arc:-90:0" \
-  "drag:50,80,80,50" "arc:-90:0"
+  "drag:80,50,50,20" "arc:90:0" \
+  "drag:50,20,20,50" "arc:90:0" \
+  "drag:20,50,50,80" "arc:90:0" \
+  "drag:50,80,80,50" "arc:90:0"
 ```
 
 **Arc syntax:** `arc:<position>:<tension>`
-- **Position** (±1 to ±179): Sign = direction (+ left, - right), magnitude = arc angle
-- **Tension**: 0 = true circle, negative = flatter, positive = sharper (L-corner)
+- **Position** (±1 to ±179): Sign = curve direction, magnitude = arc angle in degrees
+  - Mental model: Imagine walking the path. `+` bulges toward your right hand, `-` bulges toward your left hand
+- **Tension**: 0 = true circular arc, negative = flatter, positive = sharper (L-corner)
 
 **Chain behaviors:**
 - **Batching**: Consecutive drags are batched into a single Python call for smooth, pause-free motion
@@ -322,20 +323,20 @@ Use `--arc` with `--drag` to draw curved paths. Combine with `--aspect` for geom
 ```bash
 # Draw a smiley face in ONE chain (no connecting lines between elements)
 ./bin/interact.sh --in-app Firefox --aspect 5,38,56,79 --chain \
-  "drag:85,50,50,15" "arc:-90:0" "drag:50,15,15,50" "arc:-90:0" \
-  "drag:15,50,50,85" "arc:-90:0" "drag:50,85,85,50" "arc:-90:0" \
+  "drag:85,50,50,15" "arc:90:0" "drag:50,15,15,50" "arc:90:0" \
+  "drag:15,50,50,85" "arc:90:0" "drag:50,85,85,50" "arc:90:0" \
   "dragend:" \
-  "drag:42,40,35,33" "arc:-90:0" "drag:35,33,28,40" "arc:-90:0" \
-  "drag:28,40,35,47" "arc:-90:0" "drag:35,47,42,40" "arc:-90:0" \
+  "drag:42,40,35,33" "arc:90:0" "drag:35,33,28,40" "arc:90:0" \
+  "drag:28,40,35,47" "arc:90:0" "drag:35,47,42,40" "arc:90:0" \
   "dragend:" \
-  "drag:72,40,65,33" "arc:-90:0" "drag:65,33,58,40" "arc:-90:0" \
-  "drag:58,40,65,47" "arc:-90:0" "drag:65,47,72,40" "arc:-90:0" \
+  "drag:72,40,65,33" "arc:90:0" "drag:65,33,58,40" "arc:90:0" \
+  "drag:58,40,65,47" "arc:90:0" "drag:65,47,72,40" "arc:90:0" \
   "dragend:" \
-  "drag:30,65,70,65" "arc:-40:0"
+  "drag:30,65,70,65" "arc:40:0"
 ```
 
 **Common shapes:**
-- **Circle**: 4 quarter arcs with `arc:-90:0` (or `arc:90:0` for opposite direction)
+- **Circle**: 4 quarter arcs with `arc:90:0` (curves outward)
 - **Flower/pinwheel**: Alternating `arc:-60:0` and `arc:60:0` for curved petals
 - **Star**: Straight drags connecting outer and inner points
 
@@ -497,7 +498,7 @@ Prioritize **thoroughness over throughput** - completing a task partially 5 time
 Draw curves instead of straight lines using `--arc position:tension`:
 
 ```bash
-# Basic arc (curves left)
+# Basic arc (walking left-to-right, +90 bulges toward your right hand = downward)
 ./bin/interact.sh --arc 90:0 --drag 20,50,80,50
 
 # In chains (arc modifies following drag)
@@ -506,7 +507,9 @@ Draw curves instead of straight lines using `--arc position:tension`:
 
 **Arc parameters:**
 - **Position** (±1 to ±179): Controls direction and arc angle
-  - Sign: `+` curves left of travel, `-` curves right
+  - **Mental model**: Imagine walking the path. `+` bulges toward your right hand, `-` bulges toward your left hand
+  - For clockwise circles: outside is on your right → use `+90`
+  - For counterclockwise curves (like belly of "5"): outside is on your left → use `-90`
   - Magnitude: arc angle in degrees (`90` = quarter circle)
 - **Tension**: Shape control
   - `0` = **TRUE circular arc** (mathematically perfect, uses parametric equations)
@@ -515,13 +518,13 @@ Draw curves instead of straight lines using `--arc position:tension`:
 
 **Drawing circles (4 quarter-arcs):**
 ```bash
-# Circle: use NEGATIVE position to curve outward (right of travel = outside)
+# Circle: use POSITIVE position to curve outward
 ./bin/interact.sh --in-app Firefox --drag-easing linear --drag-steps 100 --chain \
-  "drag:47,57,32,42" "arc:-90:0" \
-  "drag:32,42,17,57" "arc:-90:0" \
-  "drag:17,57,32,72" "arc:-90:0" \
-  "drag:32,72,47,57" "arc:-90:0"
-# Note: For perfect circles, use square aspect ratio or calculate pixel-accurate points
+  "drag:47,57,32,42" "arc:90:0" \
+  "drag:32,42,17,57" "arc:90:0" \
+  "drag:17,57,32,72" "arc:90:0" \
+  "drag:32,72,47,57" "arc:90:0"
+# Note: For perfect circles, use --aspect to ensure square coordinate space
 ```
 
 **Auto-chaining:** Consecutive drags in a chain automatically stay connected:
@@ -632,6 +635,52 @@ elements:42 images:3
 - Skips browser chrome (top 10% of window)
 - Skips overly large regions (> 30% of screen)
 - Detects colorful content (photos) vs text/UI elements
+
+---
+
+## Icon Detection
+
+`--read-page` automatically detects small UI elements (icons, buttons) that don't have text labels. Icons are extracted to `/tmp/icon_*.jpg` so the LLM can visually identify them.
+
+**Output format:**
+```
+@page Firefox display:1 viewport:1920x1080
+[15.2,8.4] Welcome to Firefox
+[18.5,10.8,2.1,2.0] [ICON:/tmp/icon_a1b2c3.jpg "small-icon"]
+[50.0,35.2] [IMAGE:/tmp/img_e5f6g7.jpg "Hero image"]
+---
+elements:42 icons:3 images:1
+```
+
+**Icon types:**
+- `small-icon`: Very small elements (< 2% of viewport)
+- `icon`: Standard icon size (2-4% of viewport)
+- `button`: Larger clickable elements (4-8% of viewport)
+
+**Viewing icons:** Use Claude's Read tool on the `/tmp/icon_*.jpg` paths to see what the icon looks like:
+```
+# In the --read-page output, you see:
+[18.5,10.8,2.1,2.0] [ICON:/tmp/icon_a1b2c3.jpg "small-icon"]
+
+# Use Read tool on the path to identify the icon (moon, sun, gear, etc.)
+```
+
+**Clicking icons:** Use the bounding box coordinates directly:
+```bash
+./bin/interact.sh --in-app Firefox --click 18.5,10.8
+```
+
+**Disabling icon detection:** Use `--no-icons` for faster extraction:
+```bash
+./bin/interact.sh --read-page Firefox --no-icons
+```
+
+**Use cases:**
+- Dark/light mode toggles (moon/sun icons)
+- Settings gear icons
+- Close/minimize buttons
+- Navigation arrows
+- Any UI element without text
 
 ---
 

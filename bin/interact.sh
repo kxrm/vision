@@ -8,6 +8,7 @@ PYTHON="$PROJECT_ROOT/venv/bin/python"
 LIB_DIR="$PROJECT_ROOT/lib"
 OCR_FIND="$LIB_DIR/ocr_find.py"
 IMAGE_DETECT="$LIB_DIR/image_detect.py"
+ELEMENT_DETECT="$LIB_DIR/element_detect.py"
 SCREENSHOT="$SCRIPT_DIR/screenshot.sh"
 WINDOW_LIST="$LIB_DIR/window_list.py"
 UI_ELEMENTS="$LIB_DIR/ui_elements.py"
@@ -30,8 +31,14 @@ AUTO_WAIT_TIMEOUT=3000
 # OCR timeout for text search operations (default 10s to allow for app activation + screenshot + OCR)
 OCR_TIMEOUT="${OCR_TIMEOUT:-10}"
 
+# Read page timeout in seconds (OCR + image detection + icon detection can be slow)
+READ_PAGE_TIMEOUT="${READ_PAGE_TIMEOUT:-10}"
+
 # Image detection for --read-page (enabled by default, disable with --no-images)
 DETECT_IMAGES=1
+
+# Icon detection for --read-page (enabled by default, disable with --no-icons)
+DETECT_ICONS=1
 
 # Typing configuration (safe mode prevents macOS shortcut collisions)
 TYPE_DELAY="${TYPE_DELAY:-30}"  # Default 30ms inter-character delay
@@ -139,7 +146,7 @@ auto_read_page() {
         echo "---" >&2
 
         # Run read_page with timeout to avoid hanging on OCR
-        local timeout_sec=$(( (AUTO_WAIT_TIMEOUT + 2000) / 1000 ))  # Convert ms to sec, add buffer
+        local timeout_sec="$READ_PAGE_TIMEOUT"
         local read_output=""
         local read_pid
 
@@ -359,6 +366,7 @@ OCR TEXT OPERATIONS:
                                        --json (structured JSON output)
                                        --save-screenshot <path>
                                        --no-images (skip image detection)
+                                       --no-icons (skip icon detection)
                                        --region x1,y1,x2,y2 (filter to % region)
     --near <text>             Select match closest to anchor text (RECOMMENDED for disambiguation)
                               Use when multiple matches exist - finds the one nearest to anchor.
@@ -2569,13 +2577,12 @@ find_text_on_screen() {
     [[ -n "$display" ]] && find_args+=(--display "$display")
 
     # Run find_text.py with timeout
-    local ocr_timeout=$(( (AUTO_WAIT_TIMEOUT + 2000) / 1000 ))
     local result
-    result=$(run_with_timeout "$ocr_timeout" "$PYTHON" "$LIB_DIR/find_text.py" "${find_args[@]}" 2>&1)
+    result=$(run_with_timeout "$OCR_TIMEOUT" "$PYTHON" "$LIB_DIR/find_text.py" "${find_args[@]}" 2>&1)
     local status=$?
 
     if [[ $status -eq 124 ]]; then
-        echo "ERROR: OCR timed out after ${ocr_timeout}s"
+        echo "ERROR: OCR timed out after ${OCR_TIMEOUT}s"
         return 1
     fi
 
@@ -2787,21 +2794,26 @@ read_page() {
     fi
 
     # Run OCR to get all text with positions (with timeout to prevent hanging)
-    local ocr_timeout=$(( (AUTO_WAIT_TIMEOUT + 2000) / 1000 ))
     local ocr_output
-    ocr_output=$(run_with_timeout "$ocr_timeout" "$PYTHON" "$OCR_FIND" "$temp_screenshot" --list --json 2>/dev/null)
+    ocr_output=$(run_with_timeout "$READ_PAGE_TIMEOUT" "$PYTHON" "$OCR_FIND" "$temp_screenshot" --list --json 2>/dev/null)
     local ocr_status=$?
 
     if [[ $ocr_status -eq 124 ]]; then
-        echo "WARNING: OCR timed out after ${ocr_timeout}s" >&2
+        echo "WARNING: OCR timed out after ${READ_PAGE_TIMEOUT}s" >&2
         rm -f "$temp_screenshot"
         return 1
     fi
 
-    # Run image detection if enabled
+    # Run image detection if enabled (with timeout)
     local image_output=""
     if [[ "$DETECT_IMAGES" == "1" && -f "$IMAGE_DETECT" ]]; then
-        image_output=$("$PYTHON" "$IMAGE_DETECT" "$temp_screenshot" --json 2>/dev/null)
+        image_output=$(run_with_timeout "$READ_PAGE_TIMEOUT" "$PYTHON" "$IMAGE_DETECT" "$temp_screenshot" --json 2>/dev/null)
+    fi
+
+    # Run icon detection if enabled (with timeout)
+    local icon_output=""
+    if [[ "$DETECT_ICONS" == "1" && -f "$ELEMENT_DETECT" ]]; then
+        icon_output=$(run_with_timeout "$READ_PAGE_TIMEOUT" "$PYTHON" "$ELEMENT_DETECT" --image "$temp_screenshot" --extract --json 2>/dev/null)
     fi
 
     # Get bubble position if running (for LLM awareness of obscured areas)
@@ -2812,7 +2824,7 @@ read_page() {
     fi
 
     # Format output using Python
-    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" "$region" "$aspect" << 'PYEOF'
+    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" "$region" "$aspect" "$icon_output" << 'PYEOF'
 import json
 import sys
 
@@ -2827,6 +2839,7 @@ image_json = sys.argv[8] if len(sys.argv) > 8 else ""
 bubble_info = sys.argv[9] if len(sys.argv) > 9 else ""
 region_str = sys.argv[10] if len(sys.argv) > 10 else ""
 aspect_mode = sys.argv[11] == "true" if len(sys.argv) > 11 else False
+icon_json = sys.argv[12] if len(sys.argv) > 12 else ""
 
 # Aspect transformation: convert to square coordinate space
 win_w_f = float(win_w) if win_w else 0
@@ -2879,7 +2892,13 @@ try:
 except:
     image_elements = []
 
-# Merge text and images into unified elements list, applying region filter
+# Parse icon elements
+try:
+    icon_elements = json.loads(icon_json) if icon_json else []
+except:
+    icon_elements = []
+
+# Merge text, images, and icons into unified elements list, applying region filter
 elements = []
 for e in text_elements:
     bounds = e.get('bounds_pct', {})
@@ -2900,6 +2919,19 @@ for img in image_elements:
             'description': img.get('description', 'Image')
         })
 
+for icon in icon_elements:
+    # Icon bbox is [x, y, w, h] array, convert to dict
+    bbox = icon.get('bbox', [0, 0, 0, 0])
+    bounds = {'x': bbox[0], 'y': bbox[1], 'width': bbox[2], 'height': bbox[3]}
+    if in_region(bounds, region):
+        elements.append({
+            'type': 'icon',
+            'bounds_pct': bounds,
+            'path': icon.get('path', ''),
+            'icon_type': icon.get('type', 'icon'),
+            'icon_desc': icon.get('desc', '')
+        })
+
 # Sort by position (top-to-bottom, left-to-right reading order)
 def sort_key(e):
     b = e.get('bounds_pct', {})
@@ -2910,7 +2942,8 @@ def sort_key(e):
 elements.sort(key=sort_key)
 
 image_count = sum(1 for e in elements if e['type'] == 'image')
-text_count = len(elements) - image_count
+icon_count = sum(1 for e in elements if e['type'] == 'icon')
+text_count = len(elements) - image_count - icon_count
 
 if json_output:
     output = {
@@ -2933,6 +2966,14 @@ if json_output:
                 "type": "image",
                 "path": e.get('path', ''),
                 "desc": e.get('description', '')
+            }
+        elif e['type'] == 'icon':
+            elem = {
+                "b": [x, y, w, h],
+                "type": "icon",
+                "path": e.get('path', ''),
+                "icon_type": e.get('icon_type', 'icon'),
+                "desc": e.get('icon_desc', '')
             }
         else:
             elem = {
@@ -2959,11 +3000,18 @@ else:
             path = e.get('path', '')
             desc = e.get('description', 'Image')
             print(f"[{x},{y},{w},{h}] [IMAGE:{path} \"{desc}\"]")
+        elif e['type'] == 'icon':
+            path = e.get('path', '')
+            icon_type = e.get('icon_type', 'icon')
+            icon_desc = e.get('icon_desc', '')
+            # Include description if available, otherwise just type
+            label = f"{icon_type} {icon_desc}".strip() if icon_desc else icon_type
+            print(f"[{x},{y},{w},{h}] [ICON:{path} \"{label}\"]")
         else:
             text = e.get('text', '')
             print(f"[{x},{y},{w},{h}] {text}")
     print("---")
-    print(f"elements:{text_count} images:{image_count}")
+    print(f"elements:{text_count} icons:{icon_count} images:{image_count}")
 PYEOF
 
     rm -f "$temp_screenshot"
@@ -3827,7 +3875,7 @@ PYEOF
     if [[ -n "$IN_APP" ]]; then
         sleep 0.3  # Brief pause for UI to settle
         # Run read_page with timeout to avoid hanging on OCR
-        local timeout_sec=$(( (AUTO_WAIT_TIMEOUT + 2000) / 1000 ))  # Convert ms to sec, add buffer
+        local timeout_sec="$READ_PAGE_TIMEOUT"
         local read_output=""
 
         # Use background process with timeout (macOS compatible)
@@ -4589,6 +4637,7 @@ main() {
                         --json) rp_json="true"; shift ;;
                         --save-screenshot) rp_save="$2"; shift 2 ;;
                         --no-images) DETECT_IMAGES=0; shift ;;
+                        --no-icons) DETECT_ICONS=0; shift ;;
                         --region) rp_region="$2"; shift 2 ;;
                         --aspect) rp_aspect="true"; shift ;;
                         *) break ;;
