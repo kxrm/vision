@@ -87,7 +87,7 @@ def detect_small_rectangles(image_path: str, min_size_pct: float = 0.5) -> List[
 
 def detect_contrast_regions(image_path: str, min_size_px: int = 12, max_size_px: int = 60) -> List[Dict]:
     """
-    Detect high-contrast regions using PIL edge detection.
+    Detect high-contrast regions using numpy-accelerated edge detection.
     Good for finding icons that may not have clear rectangular borders.
 
     Args:
@@ -98,6 +98,8 @@ def detect_contrast_regions(image_path: str, min_size_px: int = 12, max_size_px:
     Returns:
         List of detected regions
     """
+    import numpy as np
+
     img = Image.open(image_path)
     width, height = img.size
 
@@ -105,26 +107,37 @@ def detect_contrast_regions(image_path: str, min_size_px: int = 12, max_size_px:
     gray = img.convert('L')
     edges = gray.filter(ImageFilter.FIND_EDGES)
 
-    # Scan for high-edge-density regions using a grid
-    cell_size = 16  # pixels per cell
+    # Convert to numpy for fast grid operations
+    edge_arr = np.array(edges)
+
+    # Use larger cells with no overlap (clustering merges adjacent anyway)
+    cell_size = 24  # pixels per cell (larger = faster + better for icon size)
     regions = []
 
-    for y in range(0, height - cell_size, cell_size // 2):
-        for x in range(0, width - cell_size, cell_size // 2):
-            # Get edge density in this cell
-            cell = edges.crop((x, y, x + cell_size, y + cell_size))
-            stat = ImageStat.Stat(cell)
-            edge_mean = stat.mean[0]
+    # Vectorized: compute mean for each cell using reshape
+    n_rows = height // cell_size
+    n_cols = width // cell_size
 
-            # High edge density indicates potential element boundary
-            # Lower threshold (20) catches subtle icons like moon/sun toggles
-            if edge_mean > 20:
+    # Truncate to fit cell grid
+    truncated = edge_arr[:n_rows * cell_size, :n_cols * cell_size]
+
+    # Reshape into cells and compute means
+    cells = truncated.reshape(n_rows, cell_size, n_cols, cell_size)
+    cell_means = cells.mean(axis=(1, 3))
+
+    # Find cells above threshold
+    threshold = 20
+    for row in range(n_rows):
+        for col in range(n_cols):
+            if cell_means[row, col] > threshold:
+                x = col * cell_size
+                y = row * cell_size
                 regions.append({
                     'x': round(x * 100 / width, 1),
                     'y': round(y * 100 / height, 1),
                     'w': round(cell_size * 100 / width, 1),
                     'h': round(cell_size * 100 / height, 1),
-                    'edge_density': round(edge_mean, 1),
+                    'edge_density': round(float(cell_means[row, col]), 1),
                     'source': 'contrast'
                 })
 
@@ -436,7 +449,9 @@ def extract_icon(image: Image.Image, bbox: List[float],
 def detect_and_extract_icons(image_path: str,
                              min_size_pct: float = 0.5,
                              max_size_pct: float = 8.0,
-                             output_dir: str = "/tmp") -> List[Dict]:
+                             output_dir: str = "/tmp",
+                             max_icons: int = 20,
+                             region: Optional[Tuple[float, float, float, float]] = None) -> List[Dict]:
     """
     Detect and extract icons from an image.
 
@@ -445,6 +460,8 @@ def detect_and_extract_icons(image_path: str,
         min_size_pct: Minimum element size as % of image area
         max_size_pct: Maximum element size as % of image area
         output_dir: Directory for extracted icon images
+        max_icons: Maximum number of icons to extract (default 20, 0 = unlimited)
+        region: Optional (x1, y1, x2, y2) percentages to filter icons (0-100)
 
     Returns:
         List of icons with bbox, type, and path to extracted image
@@ -458,9 +475,21 @@ def detect_and_extract_icons(image_path: str,
     # Detect elements using existing pipeline
     elements = detect_elements(image_path, min_size_pct, max_size_pct * max_size_pct)
 
+    # Apply region filter if specified (before max_icons limit)
+    if region:
+        x1, y1, x2, y2 = region
+        elements = [e for e in elements
+                    if e['bbox'][0] >= x1 and e['bbox'][1] >= y1
+                    and e['bbox'][0] + e['bbox'][2] <= x2
+                    and e['bbox'][1] + e['bbox'][3] <= y2]
+
     # Filter to only icon-sized elements and extract them
     icons = []
     for elem in elements:
+        # Stop if we've reached the limit
+        if max_icons > 0 and len(icons) >= max_icons:
+            break
+
         if elem['type'] in ('small-icon', 'icon', 'button'):
             bbox = elem['bbox']
             path, description = extract_icon(image, bbox, output_dir)
@@ -489,8 +518,22 @@ def main():
                         help='Min element size %% (default: 0.5)')
     parser.add_argument('--max-size', type=float, default=8.0,
                         help='Max element size %% for icons (default: 8.0)')
+    parser.add_argument('--max-icons', type=int, default=20,
+                        help='Max icons to extract (default: 20, 0=unlimited)')
+    parser.add_argument('--region', type=str, default=None,
+                        help='Region filter as x1,y1,x2,y2 percentages (e.g., "0,15,100,100" to skip top 15%%)')
 
     args = parser.parse_args()
+
+    # Parse region if provided
+    region = None
+    if args.region:
+        try:
+            parts = [float(x) for x in args.region.split(',')]
+            if len(parts) == 4:
+                region = tuple(parts)
+        except ValueError:
+            pass
 
     if args.extract:
         # Detect and extract icons to files
@@ -498,7 +541,9 @@ def main():
             args.image,
             min_size_pct=args.min_size,
             max_size_pct=args.max_size,
-            output_dir=args.output_dir
+            output_dir=args.output_dir,
+            max_icons=args.max_icons,
+            region=region
         )
 
         if args.json:
