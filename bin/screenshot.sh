@@ -361,6 +361,7 @@ capture_region_interactive() {
 # Coordinate-based region capture
 capture_region_coords() {
     local coords="$1"
+    local custom_out="$2"
 
     # Parse coordinates (x,y,w,h)
     IFS=',' read -r x y w h <<< "$coords"
@@ -371,7 +372,7 @@ capture_region_coords() {
         return 1
     fi
 
-    local output=$(generate_filename)
+    local output="${custom_out:-$(generate_filename)}"
 
     local cmd="screencapture -x -R ${x},${y},${w},${h}"
     [[ -n "$INCLUDE_CURSOR" ]] && cmd="$cmd -C"
@@ -426,6 +427,7 @@ preview_click() {
 # Automatically adds crosshairs to show exact click point
 capture_at_cursor() {
     local size="${1:-400}"  # Default 400x400 box
+    local custom_out="$2"
 
     # Get current mouse position using cliclick
     local pos=$(cliclick p 2>/dev/null)
@@ -449,7 +451,7 @@ capture_at_cursor() {
     echo "Cursor at: $cursor_x, $cursor_y"
     echo "Capturing ${size}x${size} region centered on cursor..."
 
-    local output=$(generate_filename "cursor_region")
+    local output="${custom_out:-$(generate_filename "cursor_region")}"
 
     # Always include cursor for this mode
     local cmd="screencapture -x -C -R ${x},${y},${size},${size}"
@@ -620,10 +622,10 @@ main() {
             capture_region_interactive
             ;;
         region_coords)
-            capture_region_coords "$coords"
+            capture_region_coords "$coords" "$custom_output"
             ;;
         at_cursor)
-            capture_at_cursor "$cursor_size"
+            capture_at_cursor "$cursor_size" "$custom_output"
             ;;
         preview)
             preview_click "$preview_coords" "$display"
@@ -641,9 +643,15 @@ main() {
 
     # Resize for Claude API unless --full-res was specified
     if [[ -z "$FULL_RES" && $result -eq 0 ]]; then
-        local latest=$(find_latest_screenshot)
-        if [[ -n "$latest" ]]; then
-            resize_for_claude "$latest"
+        if [[ -n "$custom_output" && -f "$custom_output" ]]; then
+            # Resize custom output file directly
+            resize_for_claude "$custom_output"
+        else
+            # Fall back to finding latest screenshot
+            local latest=$(find_latest_screenshot)
+            if [[ -n "$latest" ]]; then
+                resize_for_claude "$latest"
+            fi
         fi
     fi
 
