@@ -96,7 +96,7 @@ The `--grant` walkthrough:
 **Default Resizing (Anthropic API Limit):**
 Screenshots are automatically resized to 1568px max dimension by default. This is due to Anthropic's API limits (2000px for multi-image conversations) and Claude's internal processing size (1568px). Images already under 1568px are not resized.
 
-Use `--full-res` only when you need original resolution for external tools. OCR operations (`--click-text`, `--find-text`, `--read-page`) automatically use full resolution internally.
+Use `--full-res` only when you need original resolution for external tools. OCR operations (`--click`, `--find-text`, `--read-page`) automatically use full resolution internally.
 
 ### 2. `snapshot.sh` - Webcam with PTZ Control
 
@@ -120,14 +120,16 @@ The most powerful tool. Handles mouse, keyboard, OCR, and app control.
 ./bin/interact.sh --in-app "Firefox"     # Set target app (persists across commands)
 ```
 
-**Mouse actions:**
+**Click actions (unified --click with auto-detection):**
 ```bash
-./bin/interact.sh --click 50,50          # Click at grid percentage (0-100)
-./bin/interact.sh --click-text "Submit"  # Click on text via OCR
-./bin/interact.sh --double-click-text "file.txt"  # Double-click to open
-./bin/interact.sh --right-click 50,50    # Right-click at coordinates
-./bin/interact.sh --right-click-text "README.md"  # Right-click on OCR text (context menu)
-./bin/interact.sh --scroll down 3        # Scroll down 3 units
+./bin/interact.sh --click 50,50              # Click at grid percentage (0-100)
+./bin/interact.sh --click "Submit"           # Click on text via OCR (auto-detected)
+./bin/interact.sh --click "file.txt" --double  # Double-click to open
+./bin/interact.sh --click 50,50 --right      # Right-click at coordinates
+./bin/interact.sh --click "Edit" --right     # Right-click on text (context menu)
+./bin/interact.sh --click --triple           # Triple-click at cursor (select line)
+./bin/interact.sh --click px:1200,500        # Click at absolute pixel coordinates
+./bin/interact.sh --scroll down 3            # Scroll down 3 units
 ```
 
 **Keyboard actions:**
@@ -157,8 +159,11 @@ The most powerful tool. Handles mouse, keyboard, OCR, and app control.
 **Chains (atomic multi-step operations):**
 ```bash
 ./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:google.com" "key:return"
-./bin/interact.sh --chain "click-text:Submit" "wait:1000"
-./bin/interact.sh --chain "back" "back" "back"  # Navigate back multiple times
+./bin/interact.sh --chain "click:Submit" "wait:1000"  # Click on text (auto-detected)
+./bin/interact.sh --chain "click:file.txt|double"     # Double-click in chain
+./bin/interact.sh --chain "click:Edit|right"          # Right-click in chain
+./bin/interact.sh --chain "click:toggle:Dark Mode"    # Click A11y toggle
+./bin/interact.sh --chain "back" "back" "back"        # Navigate back multiple times
 ```
 
 **Media/system state:**
@@ -186,10 +191,10 @@ Without `--in-app`, OCR searches the ENTIRE screen and will find text in wrong w
 
 ```bash
 # WRONG - may click text in terminal or other windows
-./bin/interact.sh --click-text "Submit"
+./bin/interact.sh --click "Submit"
 
 # CORRECT - scoped to app window only
-./bin/interact.sh --in-app "Firefox" --click-text "Submit"
+./bin/interact.sh --in-app "Firefox" --click "Submit"
 ```
 
 ### Rule 2: Coordinate Systems
@@ -205,30 +210,40 @@ Chains handle auto-waiting between steps:
 ./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:example.com" "key:return"
 ```
 
-Chain actions: `browse`, `open`, `activate`, `wait`, `click`, `click-text`, `click-text-near`, `right-click-text`, `right-click-text-near`, `drag`, `arc`, `dragend`, `drag-easing`, `drag-steps`, `type`, `key`, `combo`, `scroll`, `page-top`, `page-bottom`, `back`, `back-no-close`, `forward`, `close-tab`, `screenshot`
+Chain actions: `browse`, `open`, `activate`, `wait`, `click` (with modifiers), `drag`, `arc`, `dragend`, `drag-easing`, `drag-steps`, `type`, `key`, `combo`, `scroll`, `page-top`, `page-bottom`, `back`, `back-no-close`, `forward`, `close-tab`, `screenshot`
+
+**Click modifiers in chains:**
+- `click:Submit` - click on text (auto-detected)
+- `click:50,50` - click at coordinates
+- `click:Submit|double` - double-click
+- `click:Submit|right` - right-click
+- `click:Submit|triple` - triple-click
+- `click:Submit|near:anchor` - proximity click
+- `click:toggle:label` - A11y toggle
+- `click:info:label` - A11y info button
 
 **LLM Guidance - When to use chains:**
 If you already know you need multiple sequential actions, use a single `--chain` command instead of separate commands. Common patterns:
 - **Combining elements**: Two drags to the same destination → `--chain "drag:src1,dest" "drag:src2,dest"`
 - **Form filling**: Multiple fields → `--chain "click:x,y" "type:value" "click:x2,y2" "type:value2"`
-- **Navigation + action**: → `--chain "browse:url" "wait:1000" "click-text:Button"`
+- **Navigation + action**: → `--chain "browse:url" "wait:1000" "click:Button"`
 
 Think of it like shell commands: if you'd write `cmd1 && cmd2 && cmd3`, use `--chain "action1" "action2" "action3"`.
 
 ### Rule 4: Multiple OCR Matches - Use `--near` for Disambiguation
 When multiple matches exist (common on list pages like Reddit, Hacker News), use `--near` to select by context.
 
-**Important:** `--near` must come BEFORE `--click-text` in the command line.
+**Important:** `--near` must come BEFORE `--click` in the command line.
 
 ```bash
 # Recommended: click "48 comments" nearest to "Pure Silicon" article
-./bin/interact.sh --in-app Firefox --near "Pure Silicon" --click-text "48 comments"
+./bin/interact.sh --in-app Firefox --near "Pure Silicon" --click "48 comments"
 
 # In chains (more convenient - order doesn't matter):
-./bin/interact.sh --chain "in-app:Firefox" "click-text-near:48 comments|Pure Silicon"
+./bin/interact.sh --chain "in-app:Firefox" "click:48 comments|near:Pure Silicon"
 
 # Fallback: use --instance N if no good anchor text exists
-./bin/interact.sh --in-app "App" --instance 2 --click-text "Submit"
+./bin/interact.sh --in-app "App" --instance 2 --click "Submit"
 ```
 
 ### Rule 5: Use `browse:` for URL Navigation (STRONGLY PREFERRED)
@@ -392,6 +407,26 @@ When encountering a blocker (paywall, login wall, error), **scan available conte
 
 Prioritize **thoroughness over throughput** - completing a task partially 5 times is worse than completing it fully 4 times.
 
+### Rule 13: Reuse OCR Screenshots Before Capturing New Ones
+
+OCR operations (`--read-page`) automatically save their screenshot to:
+- `/tmp/claude/ocr_screenshot_api.jpg` (resized for API, use with Read)
+- `/tmp/claude/ocr_screenshot.png` (full resolution)
+
+The screenshot path is included in the `@page` header output.
+
+**ALWAYS check if the OCR screenshot covers what you need before calling screenshot.sh.**
+
+Use `Read: /tmp/claude/ocr_screenshot_api.jpg` when:
+- You just ran `--read-page` and need to see the visual layout
+- The target app/window hasn't changed since the OCR
+
+Only use `screenshot.sh` when:
+- You need a different window/display than the OCR target
+- You need the full desktop, not just an app window
+- You need a grid overlay
+- No recent OCR operation was performed
+
 ---
 
 ## Common Workflows
@@ -403,8 +438,8 @@ Prioritize **thoroughness over throughput** - completing a task partially 5 time
 
 # Read page and interact
 ./bin/interact.sh --read-page Firefox                    # See what's visible
-./bin/interact.sh --click-text "Sign In"                 # Click by text
-./bin/interact.sh --click 45.2,67.8                      # Or by coordinates
+./bin/interact.sh --click "Sign In"                      # Click by text (auto-detected)
+./bin/interact.sh --click 45.2,67.8                      # Or by coordinates (auto-detected)
 ```
 
 ### Navigate to URL
@@ -419,7 +454,7 @@ Prioritize **thoroughness over throughput** - completing a task partially 5 time
 ### Open File from Finder
 ```bash
 ./bin/interact.sh --activate Finder
-./bin/interact.sh --in-app Finder --double-click-text "document.pdf"
+./bin/interact.sh --in-app Finder --click "document.pdf" --double
 ```
 
 ### Take Annotated Screenshot
@@ -694,7 +729,7 @@ elements:42 icons:3 images:1
 
 4. **App names must match exactly**: Use `--list-windows` to see exact app names (e.g., "Google Chrome" not "Chrome").
 
-5. **Double-click for Finder**: Use `--double-click-text` to open files in Finder, not single click.
+5. **Double-click for Finder**: Use `--click "file" --double` to open files in Finder, not single click.
 
 6. **Coordinates persist**: `--in-app` setting persists across commands until changed or cleared with `--clear-target`.
 
@@ -704,8 +739,8 @@ elements:42 icons:3 images:1
 
 9. **Verify before clicking**: Use `./bin/screenshot.sh --preview x,y` to see exactly where a click would land before executing it.
 
-10. **Chain auto-waits**: Navigation actions in chains (`key:return`, `back`, `forward`, `click-text`) automatically wait for page changes - no manual waits needed unless you want to override.
+10. **Chain auto-waits**: Navigation actions in chains (`key:return`, `back`, `forward`, `click`) automatically wait for page changes - no manual waits needed unless you want to override.
 
 11. **Read page for coordinates**: `--read-page` output shows `[x,y,w,h] text` format (bounding box). These coordinates can be used directly with `--click x,y,w,h` (auto-clicks center) or `--point-at x,y,w,h` (for bubble positioning - auto-detects bounding box and positions outside it).
 
-12. **Use --near for disambiguation**: When multiple matches exist for `--find-text` or `--click-text`, use `--near "anchor text"` to select the match closest to the anchor. This is more reliable than `--instance N` because it uses spatial context rather than arbitrary ordering. Example: `--near "share save" --find-text "comments"` finds "comments" in the action bar, not the header.
+12. **Use --near for disambiguation**: When multiple matches exist for `--find-text` or `--click`, use `--near "anchor text"` to select the match closest to the anchor. This is more reliable than `--instance N` because it uses spatial context rather than arbitrary ordering. Example: `--near "share save" --click "comments"` finds "comments" in the action bar, not the header.

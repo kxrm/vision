@@ -62,6 +62,13 @@ REGION=""
 # Aspect ratio correction (for drawing shapes with equal proportions)
 ASPECT_CORRECT=""  # Set to "1" to use square coordinate space
 
+# Unified click modifiers (set via --double, --right, --triple, --toggle, --info)
+CLICK_DOUBLE=""
+CLICK_RIGHT=""
+CLICK_TRIPLE=""
+CLICK_TOGGLE=""
+CLICK_INFO=""
+
 # Run a command with timeout (macOS compatible)
 # Usage: run_with_timeout <timeout_sec> <command> [args...]
 # Returns: command output on success, empty string on timeout
@@ -136,6 +143,10 @@ clear_target_app() {
 
 # Flag to suppress auto-read when inside a chain (chain handles it at the end)
 IN_CHAIN=""
+
+# Track last click position for visual feedback (app-relative percentages)
+LAST_CLICK_X=""
+LAST_CLICK_Y=""
 
 # Auto-read page after navigation actions when IN_APP is set
 # Call this at the end of click_grid, scroll_at, etc.
@@ -265,6 +276,97 @@ grid_to_pixel() {
     echo "$pixel_x $pixel_y $cli_x $cli_y"
 }
 
+# Convert grid coordinates to absolute pixel position
+# Supports: x,y (point) or x,y,w,h (bounding box - auto-centers)
+# Uses globals: IN_APP, REGION, ASPECT_CORRECT, DISPLAY_*, PYTHON, WINDOW_LIST
+# Returns: "pixel_x pixel_y cli_x cli_y" (space-separated), or empty on error
+# Outputs context messages to stderr
+grid_coords_to_pixel() {
+    local coords="$1"
+
+    # Parse coordinates - support both x,y and x,y,w,h formats
+    IFS=',' read -r grid_x grid_y grid_w grid_h <<< "$coords"
+
+    if [[ -z "$grid_x" || -z "$grid_y" ]]; then
+        return 1
+    fi
+
+    # If bounding box format (x,y,w,h), calculate center point
+    if [[ -n "$grid_w" && -n "$grid_h" ]]; then
+        grid_x=$(awk "BEGIN {printf \"%.1f\", $grid_x + $grid_w / 2}")
+        grid_y=$(awk "BEGIN {printf \"%.1f\", $grid_y + $grid_h / 2}")
+        echo "Box coords → center ($grid_x,$grid_y)" >&2
+    fi
+
+    local pixel_x pixel_y
+
+    # Handle IN_APP coordinate translation
+    if [[ -n "$IN_APP" ]]; then
+        local where=$("$PYTHON" "$WINDOW_LIST" --app "$IN_APP" --where 2>&1)
+        if ! echo "$where" | grep -q "No window found"; then
+            local bounds=$(echo "$where" | grep "^BOUNDS:" | sed 's/BOUNDS: //')
+            if [[ -n "$bounds" ]]; then
+                IFS=',' read -r win_x win_y win_w win_h <<< "$bounds"
+
+                # Calculate drawing area (respects REGION if set)
+                local draw_x draw_y draw_w draw_h
+                if [[ -n "$REGION" ]]; then
+                    IFS=',' read -r rx1 ry1 rx2 ry2 <<< "$REGION"
+                    draw_x=$(awk "BEGIN {print int($win_x + $rx1 * $win_w / 100)}")
+                    draw_y=$(awk "BEGIN {print int($win_y + $ry1 * $win_h / 100)}")
+                    draw_w=$(awk "BEGIN {print int(($rx2 - $rx1) * $win_w / 100)}")
+                    draw_h=$(awk "BEGIN {print int(($ry2 - $ry1) * $win_h / 100)}")
+                else
+                    draw_x=$win_x
+                    draw_y=$win_y
+                    draw_w=$win_w
+                    draw_h=$win_h
+                fi
+
+                # Calculate absolute pixel position
+                if [[ -n "$ASPECT_CORRECT" ]]; then
+                    local min_dim=$((draw_w < draw_h ? draw_w : draw_h))
+                    local off_x=$(( (draw_w - min_dim) / 2 ))
+                    local off_y=$(( (draw_h - min_dim) / 2 ))
+                    pixel_x=$(awk "BEGIN {print int($draw_x + $off_x + $grid_x * $min_dim / 100)}")
+                    pixel_y=$(awk "BEGIN {print int($draw_y + $off_y + $grid_y * $min_dim / 100)}")
+                    echo "Aspect coords ($grid_x,$grid_y) in ${min_dim}x${min_dim} square → pixel ($pixel_x,$pixel_y)" >&2
+                else
+                    pixel_x=$(awk "BEGIN {print int($draw_x + $grid_x * $draw_w / 100)}")
+                    pixel_y=$(awk "BEGIN {print int($draw_y + $grid_y * $draw_h / 100)}")
+                    echo "App coords ($grid_x,$grid_y) in '$IN_APP' → pixel ($pixel_x,$pixel_y)" >&2
+                fi
+            fi
+        else
+            echo "WARNING: No window found for '$IN_APP', using display-relative" >&2
+        fi
+    fi
+
+    # Fallback to display-relative if not set by IN_APP path
+    if [[ -z "$pixel_x" ]]; then
+        if [[ -n "$ASPECT_CORRECT" ]]; then
+            local min_dim=$((DISPLAY_WIDTH < DISPLAY_HEIGHT ? DISPLAY_WIDTH : DISPLAY_HEIGHT))
+            local off_x=$(( (DISPLAY_WIDTH - min_dim) / 2 ))
+            local off_y=$(( (DISPLAY_HEIGHT - min_dim) / 2 ))
+            pixel_x=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $off_x + $grid_x * $min_dim / 100)}")
+            pixel_y=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $off_y + $grid_y * $min_dim / 100)}")
+            echo "Display aspect coords ($grid_x,$grid_y) → pixel ($pixel_x,$pixel_y)" >&2
+        else
+            pixel_x=$(awk "BEGIN {print int($DISPLAY_X_OFFSET + $grid_x * $DISPLAY_WIDTH / 100)}")
+            pixel_y=$(awk "BEGIN {print int($DISPLAY_Y_OFFSET + $grid_y * $DISPLAY_HEIGHT / 100)}")
+            echo "Display coords ($grid_x%,$grid_y%) → pixel ($pixel_x,$pixel_y)" >&2
+        fi
+    fi
+
+    # Format for cliclick (= prefix for negative values)
+    local cli_x="$pixel_x"
+    local cli_y="$pixel_y"
+    [[ $pixel_x -lt 0 ]] && cli_x="=$pixel_x"
+    [[ $pixel_y -lt 0 ]] && cli_y="=$pixel_y"
+
+    echo "$pixel_x $pixel_y $cli_x $cli_y"
+}
+
 # Show help
 show_help() {
     cat << 'EOF'
@@ -274,32 +376,32 @@ USAGE:
     interact.sh [OPTIONS]
 
 LLM-FRIENDLY FEATURES (automatic when --in-app is set):
-    • App-scoped OCR: --click-text and --find-text filter results to ONLY the
+    • App-scoped OCR: --click and --find-text filter results to ONLY the
       target app's window (ignores text in terminal or other windows)
     • Auto-wait: Navigation actions (click, key:return, back/forward) automatically
       wait for page to stabilize - no manual wait: commands needed. Waits timeout
       after 3000ms (configurable via --auto-wait-timeout) with a warning, not a hang.
     • Auto-read: Chains and standalone clicks/scrolls automatically return page
-      content with clickable [x,y,w,h] bounding boxes (use with --click or bubble --point-at)
-    • Coord translation: Coordinates from --read-page and --click-text are
-      app-relative and auto-translated by --click when --in-app is set
+      content with clickable [x,y,w,h] bounding boxes (use with --click)
+    • Coord translation: Coordinates from --read-page are app-relative and
+      auto-translated by --click when --in-app is set
 
     IMPORTANT: Always set --in-app first! Without it, OCR searches the entire
     screen and may find text in the wrong window (like your terminal).
 
     Two ways to interact with UI elements:
-      • OCR-based (--click-text): Works with any visible text
-      • Accessibility-based (--click-toggle, --click-info): Works with UI controls
+      • OCR-based (--click "text"): Works with any visible text
+      • Accessibility-based (--toggle, --info): Works with UI controls
         like toggles and info buttons that don't have clickable text
 
     Typical LLM workflow:
       1. ./interact.sh --in-app "System Settings"
          → Sets target app (persists across commands)
-      2. ./interact.sh --click-text "Accessibility"
+      2. ./interact.sh --click "Accessibility"
          → Finds and clicks text, filtered to app window only
-      3. ./interact.sh --click-toggle "Mouse Keys"
+      3. ./interact.sh --click --toggle "Mouse Keys"
          → Clicks toggle switch near "Mouse Keys" label (accessibility API)
-      4. ./interact.sh --click-info "Mouse Keys"
+      4. ./interact.sh --click --info "Mouse Keys"
          → Clicks info (i) button near "Mouse Keys" label (accessibility API)
       5. ./interact.sh --click 35.4,32.4
          → Auto-translates app coords, clicks, returns new page content
@@ -314,14 +416,24 @@ TIMEOUT SETTINGS:
                               page read operations. If timeout is reached, command
                               continues with a warning instead of hanging.
 
-MOUSE ACTIONS:
-    --click <x>,<y>           Left click at grid percentage (0-100)
-    --click-pixel <x>,<y>     Left click at absolute pixel coordinates
-    --click-text <text>       Click on text found via OCR (application agnostic)
-    --double-click-text <text>  Double-click on text (use to launch apps in Finder)
-    --right-click-text <text>   Right-click on text (opens context menu)
-    --right-click <x>,<y>     Right click at grid percentage
-    --double-click <x>,<y>    Double click at grid percentage
+CLICKING (unified --click command):
+    --click <target>          Click on target (auto-detects text vs coordinates)
+                              Text: --click "Submit Button"
+                              Coords: --click 50,50 or --click 50,50,10,5 (box → center)
+                              Pixels: --click px:1200,500 (absolute pixel coordinates)
+                              No target: --click (clicks at current cursor position)
+
+    Click modifiers (combine with --click):
+    --double                  Double-click (e.g., --click "file.txt" --double)
+    --right                   Right-click (opens context menu)
+    --triple                  Triple-click (select line/paragraph in text editors)
+    --near <text>             Click target nearest to anchor text
+
+    Special click modes:
+    --toggle <label>          Click toggle switch near label (A11y API)
+    --info <label>            Click info button near label (A11y API)
+
+OTHER MOUSE ACTIONS:
     --move <x>,<y>            Move mouse to grid percentage
     --move-pixel <x>,<y>      Move mouse to absolute pixel coordinates
     --drag <coords>           Drag with smooth, visible movement (grid %)
@@ -350,6 +462,8 @@ MOUSE ACTIONS:
     --scroll <dir> [amt] [x,y]  Scroll at position (dir: up/down/left/right, amt: units)
     --scroll-in-app <app> <dir> [amt]  Scroll within app's window (auto-finds display)
     --verify <x>,<y> [size]   Move to position and take crosshair screenshot
+    --verify <x>,<y>,<w>,<h> [size]  Auto-centers on bounding box (from --read-page)
+                              Works with --in-app, --aspect, --region
                               (use to verify position before clicking)
 
 WINDOW QUERIES:
@@ -357,7 +471,6 @@ WINDOW QUERIES:
     --list-windows            List all visible windows with their apps and positions
 
 OCR TEXT OPERATIONS:
-    --click-text <text>       Find text on screen via OCR and click it
     --find-text <text>        Find text and return bounding box [x,y,w,h]
     --list-text               List all text visible on current display
     --read-page [app] [opts]  Extract all visible text in LLM-friendly format
@@ -465,7 +578,7 @@ APP CONTROL:
 UTILITY:
     --wait <ms>               Wait milliseconds before next action
     --wait-for-new-window [s] Wait for new window, auto-set IN_APP (default: 10s timeout)
-                              Use after --double-click-text to detect launched app
+                              Use after --click "file" --double to detect launched app
     --screen-size             Show screen dimensions (for current display)
     --mouse-pos               Show current mouse position
     --list-displays           Show all displays with offsets
@@ -511,12 +624,13 @@ COORDINATE SYSTEM:
 
 EXAMPLES:
     ./interact.sh --click 50,50              # Click center of main display
-    ./interact.sh --display 2 --click 54,35  # Click on display 2 at 54%,35%
-    ./interact.sh --click-pixel -1200,500    # Click at absolute coordinates
+    ./interact.sh --click "Submit"           # Click on text (auto-detected)
+    ./interact.sh --click px:-1200,500       # Click at absolute pixel coordinates
+    ./interact.sh --click "file.txt" --double  # Double-click (open in Finder)
+    ./interact.sh --click "Edit" --right     # Right-click (context menu)
+    ./interact.sh --click --triple           # Triple-click at cursor (select line)
     ./interact.sh --type "Hello World"       # Type text (safe mode)
-    ./interact.sh --type-fast --type "fast" # Type using legacy cliclick (faster)
     ./interact.sh --combo cmd+t              # New browser tab
-    ./interact.sh --activate Safari          # Bring Safari to front
 
 WINDOW QUERY EXAMPLES:
     # Find which display an app is on (do this BEFORE screenshotting!)
@@ -525,38 +639,50 @@ WINDOW QUERY EXAMPLES:
     # List all visible windows
     ./interact.sh --list-windows
 
-OCR EXAMPLES (application agnostic):
+CLICK EXAMPLES:
     # Click text ONLY within a specific app's window (avoids terminal text)
-    ./interact.sh --in-app "System Settings" --click-text "Accessibility"
+    ./interact.sh --in-app "System Settings" --click "Accessibility"
 
-    # Combine with activate-before for reliability
-    ./interact.sh --in-app Firefox --activate-before Firefox --click-text "comments"
+    # Double-click to open file in Finder
+    ./interact.sh --in-app Finder --click "document.pdf" --double
 
-    # Click text with app activation (searches whole screen)
-    ./interact.sh --display 2 --activate-before Firefox --click-text "68 comments"
+    # Right-click for context menu
+    ./interact.sh --in-app Firefox --click "image.png" --right
+
+    # Click with proximity disambiguation
+    ./interact.sh --in-app Firefox --near "article title" --click "comments"
 
     # Find text without clicking (returns coordinates)
     ./interact.sh --in-app "System Settings" --find-text "Display"
 
-    # List all visible text (for debugging)
-    ./interact.sh --display 2 --list-text
+VERIFICATION WORKFLOW (preview before clicking):
+    # 1. Get coordinates from read-page
+    ./interact.sh --in-app Firefox --read-page
+    # → Returns: [45.2,67.8,10,5] Submit Button
+
+    # 2. Verify with crosshairs (works with --in-app, --aspect, bounding boxes)
+    ./interact.sh --in-app Firefox --verify 45.2,67.8,10,5
+    # → Moves cursor to center of bounding box, takes crosshair screenshot
+    # → View screenshot to confirm target is correct
+
+    # 3. Click at verified position
+    ./interact.sh --in-app Firefox --click 45.2,67.8,10,5
 
 ATOMIC CHAIN EXAMPLES:
     # Navigate to URL in Firefox (no manual waits needed - auto-wait after return)
     ./interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:news.ycombinator.com" "key:return"
     # → Auto-waits for page load, returns page content with clickable coordinates
 
-    # Search and get results (auto-waits after each navigation)
-    ./interact.sh --chain "in-app:Firefox" "combo:cmd+l" "type:duckduckgo.com" "key:return" \
-                          "type:search query" "key:return"
-    # → Returns search results with [x,y,w,h] bounding boxes ready for --click
-
     # Click on text (with auto-wait and auto-read)
-    ./interact.sh --chain "in-app:Firefox" "click-text:68 comments"
+    ./interact.sh --chain "in-app:Firefox" "click:68 comments"
     # → Clicks, auto-waits, returns new page content
 
-    # Override auto-wait when needed (explicit wait skips auto-wait)
-    ./interact.sh --chain "in-app:Firefox" "click:50,50" "wait:100" "type:fast"
+    # Double-click and right-click in chains
+    ./interact.sh --chain "in-app:Finder" "click:document.pdf|double"
+    ./interact.sh --chain "in-app:Firefox" "click:image.png|right"
+
+    # Click with proximity in chains
+    ./interact.sh --chain "in-app:Firefox" "click:comments|near:article title"
 
 UI ELEMENT EXAMPLES (for toggles, info buttons, and other non-text controls):
     # Set target app first (required for all UI element commands)
@@ -567,22 +693,21 @@ UI ELEMENT EXAMPLES (for toggles, info buttons, and other non-text controls):
     # → Shows: [89.8,57.8] AX_MOUSE_KEYS = 0.0
 
     # Click a toggle by its nearby text label
-    ./interact.sh --click-toggle "Mouse Keys"
+    ./interact.sh --click --toggle "Mouse Keys"
     # → Finds toggle on same row as "Mouse Keys" text, clicks it
 
     # Click an info (i) button to open settings detail
-    ./interact.sh --click-info "Mouse Keys"
+    ./interact.sh --click --info "Mouse Keys"
     # → Finds info button on same row as "Mouse Keys" text, clicks it
 
-    # List all interactive elements (buttons, toggles, sliders, etc.)
-    ./interact.sh --list-elements
-    # → Shows all UI controls with their app-relative coordinates
+    # In chains
+    ./interact.sh --chain "in-app:System Settings" "click:toggle:Mouse Keys"
 
 TARGETING WORKFLOW (manual - use OCR instead when possible):
     1. ./interact.sh --display 2 --verify 54,64   # Move & verify with crosshairs
     2. (view screenshot to check if crosshairs are on target)
     3. ./interact.sh --nudge 0,-5                 # Adjust up 5 pixels if needed
-    4. ./interact.sh --click-here                 # Click at current position
+    4. ./interact.sh --click                      # Click at current position
 
 MULTI-MONITOR WORKFLOW:
     1. ./screenshot.sh --list-displays       # See display offsets
@@ -721,6 +846,10 @@ click_grid() {
         echo "Box coords → center ($grid_x,$grid_y)" >&2
     fi
 
+    # Track click position for visual feedback in auto-read screenshots
+    LAST_CLICK_X="$grid_x"
+    LAST_CLICK_Y="$grid_y"
+
     # Translate app-relative coords to display-relative when IN_APP is set
     if [[ -n "$IN_APP" ]]; then
         local where=$("$PYTHON" "$WINDOW_LIST" --app "$IN_APP" --where 2>&1)
@@ -749,6 +878,9 @@ click_grid() {
 
                     if [[ "$click_type" == "dc" ]]; then
                         cliclick "$click_type:$cli_x,$cli_y"
+                    elif [[ "$click_type" == "tc" ]]; then
+                        # Triple-click: 3 rapid clicks
+                        cliclick "c:$cli_x,$cli_y" "c:$cli_x,$cli_y" "c:$cli_x,$cli_y"
                     else
                         cliclick "m:$cli_x,$cli_y" "$click_type:."
                     fi
@@ -778,10 +910,13 @@ click_grid() {
     local cli_y=$(echo "$pixels" | awk '{print $4}')
 
     echo "Clicking at grid ($grid_x%, $grid_y%) = pixel ($pixel_x, $pixel_y)"
-    # Use direct coordinates for double-click (dc) to avoid timing issues
+    # Use direct coordinates for double-click (dc) and triple-click (tc) to avoid timing issues
     # For other click types, move+click works fine
     if [[ "$click_type" == "dc" ]]; then
         cliclick "$click_type:$cli_x,$cli_y"
+    elif [[ "$click_type" == "tc" ]]; then
+        # Triple-click: 3 rapid clicks (cliclick doesn't support tc natively)
+        cliclick "c:$cli_x,$cli_y" "c:$cli_x,$cli_y" "c:$cli_x,$cli_y"
     else
         cliclick "m:$cli_x,$cli_y" "$click_type:."
     fi
@@ -809,9 +944,12 @@ click_pixel() {
     [[ $pixel_y -lt 0 ]] && cli_y="=$pixel_y"
 
     echo "Clicking at pixel ($pixel_x, $pixel_y)"
-    # Use direct coordinates for double-click (dc) to avoid timing issues
+    # Use direct coordinates for double-click (dc) and triple-click (tc) to avoid timing issues
     if [[ "$click_type" == "dc" ]]; then
         cliclick "$click_type:$cli_x,$cli_y"
+    elif [[ "$click_type" == "tc" ]]; then
+        # Triple-click: 3 rapid clicks (cliclick doesn't support tc natively)
+        cliclick "c:$cli_x,$cli_y" "c:$cli_x,$cli_y" "c:$cli_x,$cli_y"
     else
         cliclick "m:$cli_x,$cli_y" "$click_type:."
     fi
@@ -2731,6 +2869,52 @@ click_info() {
     click_element "$1" "info"
 }
 
+# Unified click function - single entry point for all click operations
+# Uses global CLICK_* flags to determine click type and mode
+# Target auto-detection: text (has non-numeric chars), grid (x,y), pixel (px:x,y)
+unified_click() {
+    local target="$1"
+    local click_type="c"
+
+    # Determine click type from modifier flags
+    [[ -n "$CLICK_DOUBLE" ]] && click_type="dc"
+    [[ -n "$CLICK_RIGHT" ]] && click_type="rc"
+    [[ -n "$CLICK_TRIPLE" ]] && click_type="tc"
+
+    # Handle modes based on flags and target
+    if [[ -n "$CLICK_TOGGLE" ]]; then
+        # A11y toggle mode
+        if [[ -z "$target" ]]; then
+            echo "ERROR: --toggle requires a label argument" >&2
+            return 1
+        fi
+        click_toggle "$target"
+    elif [[ -n "$CLICK_INFO" ]]; then
+        # A11y info button mode
+        if [[ -z "$target" ]]; then
+            echo "ERROR: --info requires a label argument" >&2
+            return 1
+        fi
+        click_info "$target"
+    elif [[ -z "$target" ]]; then
+        # No target = click at cursor
+        click_here "$click_type"
+    elif [[ "$target" == px:* ]]; then
+        # Pixel prefix: px:1200,500
+        click_pixel "${target#px:}" "$click_type"
+    elif [[ "$target" =~ ^[0-9.-]+,[0-9.-]+(,[0-9.]+,[0-9.]+)?$ ]]; then
+        # Grid % coordinate target (x,y or x,y,w,h)
+        click_grid "$target" "$click_type"
+    else
+        # Text target (OCR)
+        click_text "$target" "$click_type" "${INSTANCE:-1}" "${ACTIVATE_APP:-}"
+    fi
+
+    # Reset flags after use
+    CLICK_DOUBLE="" CLICK_RIGHT="" CLICK_TRIPLE=""
+    CLICK_TOGGLE="" CLICK_INFO=""
+}
+
 # List UI elements in current app
 # Usage: list_elements [type]
 list_elements() {
@@ -2763,6 +2947,14 @@ read_page() {
         echo "ERROR: read_page requires an app name" >&2
         return 1
     fi
+
+    # Standard OCR screenshot locations (persists for potential Read after OCR)
+    local OCR_SCREENSHOT="/tmp/claude/ocr_screenshot.png"
+    local OCR_SCREENSHOT_API="/tmp/claude/ocr_screenshot_api.jpg"
+    mkdir -p /tmp/claude 2>/dev/null
+
+    # Clean up previous OCR screenshots (at start of new run, not end)
+    rm -f "$OCR_SCREENSHOT" "$OCR_SCREENSHOT_API"
 
     # Get app window info
     local where_output=$("$PYTHON" "$WINDOW_LIST" --app "$app" --where 2>&1)
@@ -2824,7 +3016,7 @@ read_page() {
     fi
 
     # Format output using Python
-    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" "$region" "$aspect" "$icon_output" << 'PYEOF'
+    "$PYTHON" - "$ocr_output" "$app" "$display" "$win_w" "$win_h" "$classify" "$json_output" "$image_output" "$bubble_info" "$region" "$aspect" "$icon_output" "$OCR_SCREENSHOT_API" "$piece_output" << 'PYEOF'
 import json
 import sys
 
@@ -2840,6 +3032,8 @@ bubble_info = sys.argv[9] if len(sys.argv) > 9 else ""
 region_str = sys.argv[10] if len(sys.argv) > 10 else ""
 aspect_mode = sys.argv[11] == "true" if len(sys.argv) > 11 else False
 icon_json = sys.argv[12] if len(sys.argv) > 12 else ""
+screenshot_path = sys.argv[13] if len(sys.argv) > 13 else ""
+piece_json = sys.argv[14] if len(sys.argv) > 14 else ""
 
 # Aspect transformation: convert to square coordinate space
 win_w_f = float(win_w) if win_w else 0
@@ -2898,7 +3092,13 @@ try:
 except:
     icon_elements = []
 
-# Merge text, images, and icons into unified elements list, applying region filter
+# Parse piece elements (game pieces)
+try:
+    piece_elements = json.loads(piece_json) if piece_json else []
+except:
+    piece_elements = []
+
+# Merge text, images, icons, and pieces into unified elements list, applying region filter
 elements = []
 for e in text_elements:
     bounds = e.get('bounds_pct', {})
@@ -2932,6 +3132,17 @@ for icon in icon_elements:
             'icon_desc': icon.get('desc', '')
         })
 
+for piece in piece_elements:
+    # Piece has x, y, w, h keys directly
+    bounds = {'x': piece.get('x', 0), 'y': piece.get('y', 0), 'width': piece.get('w', 0), 'height': piece.get('h', 0)}
+    if in_region(bounds, region):
+        elements.append({
+            'type': 'piece',
+            'bounds_pct': bounds,
+            'color': piece.get('color', 'unknown'),
+            'circularity': piece.get('circularity', 0)
+        })
+
 # Sort by position (top-to-bottom, left-to-right reading order)
 def sort_key(e):
     b = e.get('bounds_pct', {})
@@ -2943,7 +3154,8 @@ elements.sort(key=sort_key)
 
 image_count = sum(1 for e in elements if e['type'] == 'image')
 icon_count = sum(1 for e in elements if e['type'] == 'icon')
-text_count = len(elements) - image_count - icon_count
+piece_count = sum(1 for e in elements if e['type'] == 'piece')
+text_count = len(elements) - image_count - icon_count - piece_count
 
 if json_output:
     output = {
@@ -2951,6 +3163,7 @@ if json_output:
         "display": int(display) if display else 1,
         "viewport": [int(win_w), int(win_h)],
         "scroll": "unknown",
+        "screenshot": screenshot_path if screenshot_path else None,
         "elements": []
     }
     for e in elements:
@@ -2985,7 +3198,8 @@ if json_output:
 else:
     # Line-oriented format: [x,y,w,h] where x,y is top-left corner
     aspect_flag = " --aspect" if aspect_mode else ""
-    print(f"@page {app} display:{display} viewport:{win_w}x{win_h}{aspect_flag}")
+    screenshot_info = f" screenshot:{screenshot_path}" if screenshot_path else ""
+    print(f"@page {app} display:{display} viewport:{win_w}x{win_h}{aspect_flag}{screenshot_info}")
     # Include bubble position info if running (helps LLM avoid obscured areas)
     if bubble_info:
         print(bubble_info)
@@ -3045,7 +3259,7 @@ list_screen_text() {
 # ============================================================================
 
 # Execute a chain of commands atomically
-# Usage: run_chain "activate:Firefox" "wait:300" "click-text:68 comments" "wait:500" "type:hello"
+# Usage: run_chain "activate:Firefox" "wait:300" "click:68 comments" "wait:500" "type:hello"
 run_chain() {
     local default_delay=150  # ms between commands
     IN_CHAIN=1  # Suppress auto-read in individual actions; chain handles it at end
@@ -3130,59 +3344,60 @@ run_chain() {
                 wait_ms "$arg"
                 ;;
             click)
-                echo "Chain: Clicking at $arg"
-                click_grid "$arg" "c"
+                # Unified click with pipe modifiers: click:target|double|near:anchor
+                local click_arg="$arg"
+                local click_type="c"
+                local near_text=""
+
+                # Parse modifiers (split by |)
+                while [[ "$click_arg" == *"|"* ]]; do
+                    local modifier="${click_arg##*|}"
+                    click_arg="${click_arg%|*}"
+
+                    case "$modifier" in
+                        double) click_type="dc" ;;
+                        right) click_type="rc" ;;
+                        triple) click_type="tc" ;;
+                        near:*) near_text="${modifier#near:}" ;;
+                    esac
+                done
+
+                # Build click description based on type
+                local click_desc=""
+                case "$click_type" in
+                    dc) click_desc="Double-clicking" ;;
+                    rc) click_desc="Right-clicking" ;;
+                    tc) click_desc="Triple-clicking" ;;
+                    *) click_desc="Clicking" ;;
+                esac
+
+                # Check for prefixes (toggle:, info:, px:)
+                if [[ "$click_arg" == toggle:* ]]; then
+                    echo "Chain: $click_desc toggle '${click_arg#toggle:}'${IN_APP:+ (in $IN_APP)}"
+                    click_toggle "${click_arg#toggle:}"
+                elif [[ "$click_arg" == info:* ]]; then
+                    echo "Chain: $click_desc info button '${click_arg#info:}'${IN_APP:+ (in $IN_APP)}"
+                    click_info "${click_arg#info:}"
+                elif [[ "$click_arg" == px:* ]]; then
+                    echo "Chain: $click_desc at pixel ${click_arg#px:}"
+                    click_pixel "${click_arg#px:}" "$click_type"
+                elif [[ "$click_arg" =~ ^[0-9.-]+,[0-9.-]+(,[0-9.]+,[0-9.]+)?$ ]]; then
+                    # Grid coordinates
+                    echo "Chain: $click_desc at $click_arg"
+                    click_grid "$click_arg" "$click_type"
+                else
+                    # Text target (OCR)
+                    echo "Chain: $click_desc on text '$click_arg'${near_text:+ near '$near_text'}${IN_APP:+ (in $IN_APP)}"
+
+                    # Set NEAR_TEXT if specified
+                    local saved_near="$NEAR_TEXT"
+                    [[ -n "$near_text" ]] && NEAR_TEXT="$near_text"
+                    click_text "$click_arg" "$click_type" "1"
+                    NEAR_TEXT="$saved_near"
+                fi
+
                 wait_ms "$default_delay"
                 needs_auto_wait=1  # Navigation action - auto-wait for page change
-                ;;
-            click-text)
-                echo "Chain: Clicking on text '$arg'${IN_APP:+ (in $IN_APP)}"
-                # click_text uses global IN_APP and ACTIVATE_APP if set
-                click_text "$arg" "c" "1"
-                wait_ms "$default_delay"
-                needs_auto_wait=1  # Navigation action - auto-wait for page change
-                ;;
-            click-text-near)
-                # Format: "target|anchor" - click target text nearest to anchor text
-                local target_text="${arg%%|*}"
-                local anchor_text="${arg#*|}"
-                if [[ "$target_text" == "$anchor_text" || -z "$anchor_text" ]]; then
-                    echo "Chain: ERROR - click-text-near requires format: target|anchor" >&2
-                    return 1
-                fi
-                echo "Chain: Clicking on text '$target_text' near '$anchor_text'${IN_APP:+ (in $IN_APP)}"
-                # Set NEAR_TEXT for the click operation
-                local saved_near="$NEAR_TEXT"
-                NEAR_TEXT="$anchor_text"
-                click_text "$target_text" "c" "1"
-                NEAR_TEXT="$saved_near"
-                wait_ms "$default_delay"
-                needs_auto_wait=1
-                ;;
-            right-click-text)
-                echo "Chain: Right-clicking on text '$arg'${IN_APP:+ (in $IN_APP)}"
-                click_text "$arg" "rc" "1"
-                wait_ms "$default_delay"
-                ;;
-            right-click-text-near)
-                # Format: "target|anchor" - right-click target text nearest to anchor text
-                local target_text="${arg%%|*}"
-                local anchor_text="${arg#*|}"
-                if [[ "$target_text" == "$anchor_text" || -z "$anchor_text" ]]; then
-                    echo "Chain: ERROR - right-click-text-near requires format: target|anchor" >&2
-                    return 1
-                fi
-                echo "Chain: Right-clicking on text '$target_text' near '$anchor_text'${IN_APP:+ (in $IN_APP)}"
-                local saved_near="$NEAR_TEXT"
-                NEAR_TEXT="$anchor_text"
-                click_text "$target_text" "rc" "1"
-                NEAR_TEXT="$saved_near"
-                wait_ms "$default_delay"
-                ;;
-            right-click)
-                echo "Chain: Right-clicking at $arg"
-                click_grid "$arg" "rc"
-                wait_ms "$default_delay"
                 ;;
             drag-easing)
                 # Set easing for drags: linear, ease-in, ease-out, ease-in-out
@@ -3319,11 +3534,6 @@ PYEOF
                 i=$((scan_i - 1))  # -1 because loop will increment
 
                 DRAG_MOUSE_DOWN=""
-                wait_ms "$default_delay"
-                ;;
-            double-click)
-                echo "Chain: Double-clicking at $arg"
-                click_grid "$arg" "dc"
                 wait_ms "$default_delay"
                 ;;
             type)
@@ -4132,7 +4342,12 @@ click_here() {
     local click_type="${1:-c}"
     local pos=$(cliclick p 2>/dev/null)
     echo "Clicking at current position: $pos"
-    cliclick "$click_type:."
+    if [[ "$click_type" == "tc" ]]; then
+        # Triple-click: 3 rapid clicks (cliclick doesn't support tc natively)
+        cliclick "c:." "c:." "c:."
+    else
+        cliclick "$click_type:."
+    fi
 }
 
 # Verify position: move to grid coords and take crosshair screenshot
@@ -4140,21 +4355,20 @@ verify_position() {
     local coords="$1"
     local size="${2:-300}"
 
-    IFS=',' read -r grid_x grid_y <<< "$coords"
+    # Restore target app if set (loads IN_APP from persistent state)
+    restore_target_app
 
-    if [[ -z "$grid_x" || -z "$grid_y" ]]; then
-        echo "ERROR: Invalid coordinates. Use format: x,y (e.g., 54,64)"
+    # Use unified coordinate translation (handles IN_APP, REGION, ASPECT_CORRECT, bounding box)
+    local pixels=$(grid_coords_to_pixel "$coords")
+    if [[ -z "$pixels" ]]; then
+        echo "ERROR: Invalid coordinates. Use format: x,y or x,y,w,h"
         return 1
     fi
 
-    # Move to position
-    local pixels=$(grid_to_pixel "$grid_x" "$grid_y")
     local pixel_x=$(echo "$pixels" | awk '{print $1}')
     local pixel_y=$(echo "$pixels" | awk '{print $2}')
     local cli_x=$(echo "$pixels" | awk '{print $3}')
     local cli_y=$(echo "$pixels" | awk '{print $4}')
-
-    echo "Moving to grid ($grid_x%, $grid_y%) = pixel ($pixel_x, $pixel_y)"
 
     # Use triple-move pattern to make cursor position stick
     local nudge_x=$((pixel_x + 1))
@@ -4244,21 +4458,35 @@ main() {
                 show_status
                 exit 0
                 ;;
+            --double)
+                CLICK_DOUBLE=1
+                shift
+                ;;
+            --right)
+                CLICK_RIGHT=1
+                shift
+                ;;
+            --triple)
+                CLICK_TRIPLE=1
+                shift
+                ;;
+            --toggle)
+                CLICK_TOGGLE=1
+                shift
+                ;;
+            --info)
+                CLICK_INFO=1
+                shift
+                ;;
             --click)
-                click_grid "$2" "c"
-                shift 2
-                ;;
-            --click-pixel)
-                click_pixel "$2" "c"
-                shift 2
-                ;;
-            --right-click)
-                click_grid "$2" "rc"
-                shift 2
-                ;;
-            --double-click)
-                click_grid "$2" "dc"
-                shift 2
+                # Check if next arg is a target or another flag
+                if [[ -z "$2" || "$2" == -* ]]; then
+                    unified_click ""  # No target = cursor click
+                    shift
+                else
+                    unified_click "$2"
+                    shift 2
+                fi
                 ;;
             --move)
                 move_mouse "$2" "false"
@@ -4563,26 +4791,6 @@ main() {
                     shift
                 fi
                 ;;
-            --click-here)
-                click_here "c"
-                shift
-                ;;
-            --right-click-here)
-                click_here "rc"
-                shift
-                ;;
-            --click-text)
-                click_text "$2" "c" "${INSTANCE:-1}" "${ACTIVATE_APP:-}"
-                shift 2
-                ;;
-            --double-click-text)
-                click_text "$2" "dc" "${INSTANCE:-1}" "${ACTIVATE_APP:-}"
-                shift 2
-                ;;
-            --right-click-text)
-                click_text "$2" "rc" "${INSTANCE:-1}" "${ACTIVATE_APP:-}"
-                shift 2
-                ;;
             --find-text)
                 coords=$(find_text_on_screen "$2" "${INSTANCE:-1}" "$DISPLAY_NUM")
                 if [[ $? -eq 0 ]]; then
@@ -4593,14 +4801,6 @@ main() {
             --list-text)
                 list_screen_text "$DISPLAY_NUM"
                 shift
-                ;;
-            --click-toggle)
-                click_toggle "$2"
-                shift 2
-                ;;
-            --click-info)
-                click_info "$2"
-                shift 2
                 ;;
             --list-elements)
                 if [[ -n "$2" && "$2" != --* ]]; then
