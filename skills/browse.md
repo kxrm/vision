@@ -23,7 +23,7 @@ This skill wraps `interact.sh` with simplified commands:
 
 | Command | Description | Equivalent |
 |---------|-------------|------------|
-| `go <url>` | Navigate to URL | `--chain "combo:cmd+l" "paste:<url>" "key:return"` |
+| `go <url>` | Navigate to URL (reuses existing tab) | `--chain "browse:<url>"` |
 | `click <text>` | Click text via OCR | `--click-text "<text>"` |
 | `click <text> near <anchor>` | Click text near anchor | `--near "<anchor>" --click-text "<text>"` |
 | `read` | Read page content | `--read-page` |
@@ -61,8 +61,8 @@ Default: Firefox
 ## Implementation
 
 ```bash
-# go command
-./bin/interact.sh --in-app "$APP" --chain "combo:cmd+l" "paste:$URL" "key:return" "wait:2000"
+# go command (uses browse: for smart tab reuse)
+./bin/interact.sh --in-app "$APP" --chain "browse:$URL"
 
 # click command
 ./bin/interact.sh --in-app "$APP" --click-text "$TEXT"

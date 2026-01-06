@@ -181,6 +181,7 @@ def get_element_info(element: AXUIElementRef) -> dict:
     role_desc = get_ax_attribute_value(element, "AXRoleDescription") or ""
     title = get_ax_attribute_value(element, "AXTitle") or ""
     description = get_ax_attribute_value(element, "AXDescription") or ""
+    help_text = get_ax_attribute_value(element, "AXHelp") or ""
     value = get_ax_attribute_value(element, "AXValue")
     identifier = get_ax_attribute_value(element, "AXIdentifier") or ""
 
@@ -243,6 +244,7 @@ def get_element_info(element: AXUIElementRef) -> dict:
         'type': element_type,
         'title': title,
         'description': description,
+        'help': help_text,
         'value': value,
         'identifier': identifier,
         'position': position,
@@ -399,6 +401,8 @@ def get_window_bounds(app_name: str) -> Optional[dict]:
     from Quartz import CGWindowListCopyWindowInfo, kCGWindowListOptionOnScreenOnly, kCGNullWindowID
 
     windows = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, kCGNullWindowID)
+    if not windows:
+        return None
     for window in windows:
         owner = window.get('kCGWindowOwnerName', '')
         if app_name.lower() in owner.lower():
@@ -503,13 +507,14 @@ def main():
                         pos = elem['position']
                         label = elem['title'] or elem['description'] or elem['identifier'] or '(no label)'
                         value_str = f" = {elem['value']}" if elem.get('value') is not None else ""
+                        help_str = f" [{elem['help']}]" if elem.get('help') else ""
                         if pos:
                             if args.relative and 'pct_x' in pos:
-                                print(f"  [{pos['pct_x']:5.1f},{pos['pct_y']:5.1f}] {label[:50]}{value_str}")
+                                print(f"  [{pos['pct_x']:5.1f},{pos['pct_y']:5.1f}] {label[:50]}{value_str}{help_str}")
                             else:
-                                print(f"  ({pos['center_x']:4d},{pos['center_y']:4d}) {label[:50]}{value_str}")
+                                print(f"  ({pos['center_x']:4d},{pos['center_y']:4d}) {label[:50]}{value_str}{help_str}")
                         else:
-                            print(f"  (no position) {label[:50]}{value_str}")
+                            print(f"  (no position) {label[:50]}{value_str}{help_str}")
 
         else:
             parser.print_help()

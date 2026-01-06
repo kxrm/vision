@@ -45,7 +45,7 @@ def is_dark_mode_image(image_path, threshold=100):
     return brightness < threshold
 
 
-def preprocess_image_file(image_path, force_invert=False, auto_invert=True):
+def preprocess_image_file(image_path, force_invert=False, auto_invert=True, scale_factor=1):
     """
     Preprocess image file for better OCR accuracy.
     Returns path to preprocessed image (may be same as input or temp file).
@@ -54,35 +54,47 @@ def preprocess_image_file(image_path, force_invert=False, auto_invert=True):
         image_path: Path to the image file
         force_invert: Always invert regardless of brightness
         auto_invert: Automatically invert if dark mode detected
+        scale_factor: Scale image by this factor (default 1, use 2 for small text)
 
     Returns:
         Path to preprocessed image
     """
     should_invert = force_invert or (auto_invert and is_dark_mode_image(image_path))
+    should_scale = scale_factor > 1
 
-    if not should_invert:
+    if not should_invert and not should_scale:
         return image_path
 
-    # Invert the image
+    # Load the image
     img = Image.open(image_path)
 
     # Convert to RGB if necessary (handles RGBA, etc.)
     if img.mode == 'RGBA':
-        # Preserve alpha but invert RGB
-        r, g, b, a = img.split()
-        rgb = Image.merge('RGB', (r, g, b))
-        rgb_inverted = ImageOps.invert(rgb)
-        r2, g2, b2 = rgb_inverted.split()
-        img = Image.merge('RGBA', (r2, g2, b2, a))
+        if should_invert:
+            # Preserve alpha but invert RGB
+            r, g, b, a = img.split()
+            rgb = Image.merge('RGB', (r, g, b))
+            rgb_inverted = ImageOps.invert(rgb)
+            r2, g2, b2 = rgb_inverted.split()
+            img = Image.merge('RGBA', (r2, g2, b2, a))
+        # Convert to RGB for final output
+        img = img.convert('RGB')
     elif img.mode != 'RGB':
         img = img.convert('RGB')
-        img = ImageOps.invert(img)
+        if should_invert:
+            img = ImageOps.invert(img)
     else:
-        img = ImageOps.invert(img)
+        if should_invert:
+            img = ImageOps.invert(img)
 
-    # Save to temp file
-    temp_file = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-    img.save(temp_file.name)
+    # Scale image for better small text detection
+    if should_scale:
+        new_size = (int(img.width * scale_factor), int(img.height * scale_factor))
+        img = img.resize(new_size, Image.LANCZOS)
+
+    # Save to temp file as JPG (Vision OCR has issues with RGBA PNGs)
+    temp_file = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
+    img.save(temp_file.name, 'JPEG', quality=95)
     return temp_file.name
 
 
@@ -96,15 +108,23 @@ def fuzzy_match(search_text, ocr_text, threshold=0.7):
     search_lower = search_text.lower()
     ocr_lower = ocr_text.lower()
 
-    # Direct substring match
-    if search_lower in ocr_lower:
+    # Word boundary match (preferred) - search text appears as complete word(s)
+    # Use regex word boundaries to avoid matching "new" inside "News"
+    word_pattern = r'(?:^|[\s\|\-\[\]\(\)])' + re.escape(search_lower) + r'(?:[\s\|\-\[\]\(\)\.,!?]|$)'
+    if re.search(word_pattern, ocr_lower):
         return True, 1.0
+
+    # Direct substring match - only for multi-word searches or longer terms
+    # Short words (<=4 chars) should NOT match as substrings to avoid "new" in "News"
+    if search_lower in ocr_lower and len(search_lower) > 4:
+        return True, 0.9  # Slightly lower score than word boundary match
 
     # Space-normalized match - handles LLM searches like "412 comments"
     # matching OCR text "412comments" (no space in rendered UI)
+    # Only for longer terms to avoid "new" matching "news"
     search_norm = re.sub(r'\s+', '', search_lower)
     ocr_norm = re.sub(r'\s+', '', ocr_lower)
-    if search_norm in ocr_norm:
+    if search_norm in ocr_norm and len(search_norm) > 4:
         return True, 0.98  # High score - semantic match with whitespace difference
 
     # Check if OCR text is search text with 1-2 chars missing from start
@@ -129,9 +149,10 @@ def fuzzy_match(search_text, ocr_text, threshold=0.7):
         if score >= threshold:
             return True, score
 
-    # Try to find the best matching substring in OCR text
+    # Sliding window fuzzy match - only for longer searches (>4 chars)
+    # Short words like "new" would incorrectly match "news" with this approach
     search_len = len(search_lower)
-    if search_len == 0:
+    if search_len <= 4:
         return False, 0.0
 
     best_score = 0.0
@@ -249,7 +270,8 @@ def get_substring_bbox(candidate, search_text, full_text, case_sensitive=False, 
 
 
 def find_text_in_image(image_path, search_text, case_sensitive=False, return_all=False,
-                       preprocess=True, fuzzy=True, fuzzy_threshold=0.7):
+                       preprocess=True, fuzzy=True, fuzzy_threshold=0.7,
+                       scale_factor=1, retry_with_scale=True):
     """
     Find text in an image using macOS Vision OCR.
 
@@ -261,14 +283,21 @@ def find_text_in_image(image_path, search_text, case_sensitive=False, return_all
         preprocess: Auto-invert dark mode images for better OCR
         fuzzy: Enable fuzzy matching for OCR errors (default True)
         fuzzy_threshold: Minimum similarity for fuzzy match (0.0-1.0, default 0.7)
+        scale_factor: Scale image by this factor (default 1, use 2 for small text)
+        retry_with_scale: If text not found at scale_factor=1, retry at 2x (default True)
 
     Returns:
         List of dicts with: text, confidence, bounds (x, y, width, height as percentages)
     """
+    # For short search terms (<=4 chars), use 2x scale by default
+    # These are often small UI elements (nav links, buttons) that Vision misses at 1x
+    if len(search_text) <= 4 and scale_factor == 1:
+        scale_factor = 2
+
     # Apply preprocessing for dark mode if enabled
     actual_path = str(image_path)
     if preprocess:
-        actual_path = preprocess_image_file(image_path, auto_invert=True)
+        actual_path = preprocess_image_file(image_path, auto_invert=True, scale_factor=scale_factor)
 
     # Load image
     image_url = NSURL.fileURLWithPath_(actual_path)
@@ -322,12 +351,14 @@ def find_text_in_image(image_path, search_text, case_sensitive=False, return_all
         # Check if this text matches our search
         text_to_match = text if case_sensitive else text.lower()
 
-        # Try direct match first, then fuzzy match as fallback
-        is_match = search_lower in text_to_match
-        match_score = 1.0 if is_match else 0.0
-
-        if not is_match and fuzzy:
+        # Use fuzzy_match which handles word boundaries and substring matching
+        # This avoids matching "new" inside "News"
+        if fuzzy:
             is_match, match_score = fuzzy_match(search_text, text, fuzzy_threshold)
+        else:
+            # Non-fuzzy: exact substring match only
+            is_match = search_lower in text_to_match
+            match_score = 1.0 if is_match else 0.0
 
         if is_match:
             # Try to get precise bounding box for the search text substring
@@ -398,8 +429,38 @@ def find_text_in_image(image_path, search_text, case_sensitive=False, return_all
         return exact_matches[:1]
 
     if return_all:
+        # If no matches and retry enabled, try at 2x scale
+        if not matches and retry_with_scale and scale_factor == 1:
+            return find_text_in_image(
+                image_path, search_text,
+                case_sensitive=case_sensitive,
+                return_all=True,
+                preprocess=preprocess,
+                fuzzy=fuzzy,
+                fuzzy_threshold=fuzzy_threshold,
+                scale_factor=2,
+                retry_with_scale=False
+            )
         return matches
-    return matches[:1] if matches else []
+
+    if matches:
+        return matches[:1]
+
+    # If no matches found and retry_with_scale enabled, try at 2x scale
+    # This helps detect small text that Vision misses at 1x
+    if retry_with_scale and scale_factor == 1:
+        return find_text_in_image(
+            image_path, search_text,
+            case_sensitive=case_sensitive,
+            return_all=return_all,
+            preprocess=preprocess,
+            fuzzy=fuzzy,
+            fuzzy_threshold=fuzzy_threshold,
+            scale_factor=2,
+            retry_with_scale=False  # Don't retry again
+        )
+
+    return []
 
 
 def get_all_text(image_path, preprocess=True):
@@ -443,15 +504,23 @@ def get_all_text(image_path, preprocess=True):
         candidate = candidates[0]
         bbox = observation.boundingBox()
 
-        # Convert coordinates
+        # Convert coordinates (Vision uses bottom-left origin, we want top-left)
         x_pct = bbox.origin.x * 100
         y_pct = (1 - bbox.origin.y - bbox.size.height) * 100
-        center_x_pct = x_pct + (bbox.size.width * 100) / 2
-        center_y_pct = y_pct + (bbox.size.height * 100) / 2
+        w_pct = bbox.size.width * 100
+        h_pct = bbox.size.height * 100
+        center_x_pct = x_pct + w_pct / 2
+        center_y_pct = y_pct + h_pct / 2
 
         results.append({
             'text': candidate.string(),
             'confidence': round(candidate.confidence(), 3),
+            'bounds_pct': {
+                'x': round(x_pct, 2),
+                'y': round(y_pct, 2),
+                'width': round(w_pct, 2),
+                'height': round(h_pct, 2)
+            },
             'center_pct': {
                 'x': round(center_x_pct, 2),
                 'y': round(center_y_pct, 2)
@@ -567,7 +636,8 @@ def main():
                 print(json.dumps(results, indent=2))
             else:
                 for r in results:
-                    print(f"{r['center_pct']['x']:5.1f}%, {r['center_pct']['y']:5.1f}%  "
+                    b = r['bounds_pct']
+                    print(f"[{b['x']:5.1f},{b['y']:5.1f},{b['width']:5.1f},{b['height']:4.1f}]  "
                           f"[{r['confidence']:.2f}]  {r['text']}")
 
         elif args.find:
@@ -593,8 +663,9 @@ def main():
                 if args.json:
                     print(json.dumps(match, indent=2))
                 else:
+                    b = match['bounds_pct']
                     print(f"FOUND: '{match['text']}' (near '{args.near}')")
-                    print(f"GRID: {match['center_pct']['x']},{match['center_pct']['y']}")
+                    print(f"GRID: {b['x']},{b['y']},{b['width']},{b['height']}")
                     print(f"PIXEL: {match['center_px']['x']},{match['center_px']['y']}")
                     print(f"CONFIDENCE: {match['confidence']:.3f}")
                     print(f"DISTANCE: {match.get('distance_to_anchor', 'N/A')}")
@@ -627,16 +698,18 @@ def main():
                         print(json.dumps(matches[args.instance - 1], indent=2))
                 else:
                     match = matches[args.instance - 1]
+                    b = match['bounds_pct']
                     # Output format suitable for shell parsing
                     print(f"FOUND: '{match['text']}'")
-                    print(f"GRID: {match['center_pct']['x']},{match['center_pct']['y']}")
+                    print(f"GRID: {b['x']},{b['y']},{b['width']},{b['height']}")
                     print(f"PIXEL: {match['center_px']['x']},{match['center_px']['y']}")
                     print(f"CONFIDENCE: {match['confidence']:.3f}")
 
                     if args.all and len(matches) > 1:
                         print(f"\nAll {len(matches)} matches:")
                         for i, m in enumerate(matches, 1):
-                            print(f"  {i}. '{m['text']}' at {m['center_pct']['x']:.1f}%,{m['center_pct']['y']:.1f}%")
+                            mb = m['bounds_pct']
+                            print(f"  {i}. '{m['text']}' at [{mb['x']:.1f},{mb['y']:.1f},{mb['width']:.1f},{mb['height']:.1f}]")
 
         else:
             parser.print_help()

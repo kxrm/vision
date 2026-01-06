@@ -17,6 +17,13 @@ from Foundation import NSURL
 import objc
 from PIL import Image
 
+# Add lib directory to path for sibling imports
+_lib_dir = Path(__file__).parent
+if str(_lib_dir) not in sys.path:
+    sys.path.insert(0, str(_lib_dir))
+
+from image_resize import resize_for_claude
+
 # Load Vision framework
 objc.loadBundle('Vision', globals(),
                 bundle_path='/System/Library/Frameworks/Vision.framework')
@@ -259,7 +266,7 @@ def remove_overlapping(regions: List[Dict], overlap_threshold: float = 0.5) -> L
 
 
 def extract_image(image: Image.Image, region: Dict,
-                  output_dir: str = "/tmp") -> str:
+                  output_dir: str = "/tmp", resize: bool = True) -> str:
     """
     Extract detected image region to a file.
 
@@ -267,6 +274,7 @@ def extract_image(image: Image.Image, region: Dict,
         image: Source PIL Image
         region: Region dict with bounds_pct
         output_dir: Directory for extracted images
+        resize: Resize to 1568px max for Claude API (default True)
 
     Returns:
         Path to extracted image file
@@ -297,6 +305,10 @@ def extract_image(image: Image.Image, region: Dict,
     if crop.mode == 'RGBA':
         crop = crop.convert('RGB')
     crop.save(output_path, 'JPEG', quality=85)
+
+    # Resize for Claude API if enabled (default: resize to 1568px max)
+    if resize:
+        resize_for_claude(str(output_path))
 
     return str(output_path)
 
@@ -542,7 +554,8 @@ def detect_images(image_path: str,
                   min_height_px: int = 100,
                   min_area_pct: float = 1.0,
                   extract: bool = True,
-                  output_dir: str = "/tmp") -> List[Dict]:
+                  output_dir: str = "/tmp",
+                  resize: bool = True) -> List[Dict]:
     """
     Main pipeline: detect, filter, extract, and describe images.
 
@@ -557,6 +570,7 @@ def detect_images(image_path: str,
         min_area_pct: Minimum area percentage
         extract: Whether to extract images to files
         output_dir: Directory for extracted images
+        resize: Resize extracted images for Claude API (default True)
 
     Returns:
         List of detected images with paths and descriptions
@@ -614,7 +628,7 @@ def detect_images(image_path: str,
 
         # Extract image to file
         if extract:
-            result['path'] = extract_image(pil_image, region, output_dir)
+            result['path'] = extract_image(pil_image, region, output_dir, resize=resize)
 
         # Generate description
         result['description'] = generate_description(region)
@@ -640,6 +654,8 @@ def main():
                         help='Minimum area as percentage (default: 1.0)')
     parser.add_argument('--no-extract', action='store_true',
                         help='Skip extracting images to files')
+    parser.add_argument('--no-resize', action='store_true',
+                        help='Skip resizing for Claude API (keep full resolution)')
     parser.add_argument('--output-dir', default='/tmp',
                         help='Directory for extracted images (default: /tmp)')
     parser.add_argument('--json', action='store_true',
@@ -657,7 +673,8 @@ def main():
         min_height_px=args.min_height,
         min_area_pct=args.min_area,
         extract=not args.no_extract,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        resize=not args.no_resize
     )
 
     if args.json:

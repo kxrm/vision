@@ -25,7 +25,7 @@ Runs a vision-based game loop that tracks colored objects and sends keypresses.
 | `--fps <n>` | Frames per second | 10 |
 | `--duration <sec>` | How long to run | 30 |
 | `--axis <type>` | both, x, or y | both |
-| `--no-walls` | Disable wall avoidance | |
+| `--no-avoid-walls` | Disable wall avoidance | |
 | `--debug` | Show debug info | |
 
 ## Strategies
@@ -41,7 +41,7 @@ Runs a vision-based game loop that tracks colored objects and sends keypresses.
 
 Supported colors: red, green, blue, yellow, orange, purple, white, black, gold, cyan, magenta
 
-Or use hex (`#FF5500`) or RGB (`rgb(255,85,0)`)
+Or use hex (`#FF5500`) or RGB (`rgb:255,85,0`)
 
 ## Examples
 

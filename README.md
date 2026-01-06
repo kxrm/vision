@@ -138,8 +138,8 @@ vision/
 ### Web Browsing
 
 ```bash
-# Navigate to a URL
-./bin/interact.sh --chain "in-app:Firefox" "combo:cmd+l" "paste:news.ycombinator.com" "key:return"
+# Navigate to a URL (reuses existing tab if domain matches)
+./bin/interact.sh --chain "in-app:Firefox" "browse:news.ycombinator.com"
 
 # Read page content
 ./bin/interact.sh --in-app Firefox --read-page
